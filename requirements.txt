@@ -1,8 +1,14 @@
-python-telegram-bot>=21.0
+ # Ryma Crypto AI v6 — Railway dependencies
+# Install with: pip install -r requirements_Ryma_AI.txt
+
 ccxt>=4.0.0
-pandas>=2.0.0
-numpy>=1.24.0
-matplotlib>=3.7.0
-requests>=2.31.0
-arabic-reshaper>=3.0.0
-python-bidi>=0.4.2 
+numpy
+pandas
+requests
+matplotlib
+python-telegram-bot==21.10
+
+# AI / machine-learning support
+scikit-learn
+joblib
+lightgbm
