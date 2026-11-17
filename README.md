@@ -1,0 +1,2 @@
+# TradinBot
+bot.py
