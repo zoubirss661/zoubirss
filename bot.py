@@ -2451,197 +2451,231 @@ def _hypo_levels(price,side,atr):
 _analysis_cache={}
 
 def engine_direction(sym, price=None):
-    """اتجاه المحرك الرئيسي فقط (بدون forced).
-    يرجع: 1 LONG، -1 SHORT، 0 WAIT/محايد.
-    يُستخدم لضمان توافق الرادارات مع التحليل."""
+    """Direction from the active Ryma AI decision engine; 0 only on data failure."""
     try:
-        tf = default_tf(sym)
-        df = get_candles(sym, tf, 450, ttl=120, min_bars=MIN_BARS)
-        df = add_indicators(df, 100)
-        ed = _eng_df(df)
-        ed_d = None
-        try:
-            df_d = get_candles(sym, "1d", 250, ttl=300, min_bars=100)
-            ed_d = _eng_df(add_indicators(df_d, 100))
-        except Exception:
-            pass
-        ed_h = None
-        if tf != "1h":
-            try:
-                ed_h = _eng_df(get_candles(sym, "1h", 250, ttl=300, min_bars=100))
-            except Exception:
-                pass
-        px = price
-        if px is None:
-            px, _ = live_price(sym)
-            px = float(px or df["close"].iloc[-1])
-        if px < 0.000001:
-            return 0
-        try:
-            fut = futures_score_for(sym, _sgn_i(se.trend_state(ed, len(ed)-1)) or 1)
-            fut_score = fut.get("score", 0)
-        except Exception:
-            fut_score = 0
-        deriv=derivatives_snapshot(sym)
-        funding=deriv.get("funding")
-        oi=deriv.get("oi")
-        oi_change=oi.get("change_pct") if isinstance(oi,dict) else None
-        ls_ratio=deriv.get("ls_ratio")
-        liq_data=deriv.get("liquidations")
-        patterns = []
-        btc_t = 0
-        if sym != "BTC":
-            try: btc_t = btc_trend_cached()
-            except Exception: pass
-        ev = se.evaluate(ed, ed_d, ed_h, price=px, fut_score=fut_score, btc_trend=btc_t,
-                         patterns=patterns, funding=funding, oi_change=oi_change,
-                         ls_ratio=ls_ratio, liq_data=liq_data)
-        if ev["status"] == "WAIT":
-            return 0
-        # MTF hard filter (same as analyze)
-        if ed_h is not None:
-            try:
-                h1_t = se.trend_state(ed_h, len(ed_h)-1)
-                if ev["side"] == 1 and h1_t == -2: return 0
-                if ev["side"] == -1 and h1_t == 2: return 0
-            except Exception:
-                pass
-        return int(ev["side"])
-    except Exception:
+        result = get_analysis(sym, force=True)
+        return int(result.get("side", 0)) if result and result.get("lv") else 0
+    except Exception as ex:
+        log.debug("AI direction unavailable for %s: %s", sym, ex)
         return 0
 
 
-def analyze(sym):
-    tf=default_tf(sym); df=None; last_err=None
-    fallbacks=[tf]+[x for x in ("1h","4h","1d") if x!=tf]
-    for try_tf in fallbacks:
+def _ryma_ai_decision(sym, df, df_1h, df_15m, price, deriv, ai_context):
+    """
+    Ryma AI decision layer v7:
+    regime-aware multi-timeframe confluence + derivatives/order-flow context.
+    This is a transparent rule/feature engine, NOT a trained probability model.
+    Always returns a directional setup when valid market data exists.
+    """
+    warnings, reasons, factors = [], [], {}
+    def last_num(frame, col, default=None):
         try:
-            df=get_candles(sym,try_tf,450); tf=try_tf; break
-        except PairNotFound: raise
-        except NoData as e: last_err=e; continue
-    if df is None: raise last_err or NoData(sym)
-    degraded=bool(df.attrs.get("degraded"))
-    df=add_indicators(df,100); i=len(df)-1
-    is_meme=sym in MEME_COINS
-    if is_meme:
-        long_ok=detect_meme_conditions(df,i,1); short_ok=detect_meme_conditions(df,i,-1)
-        strategy="Meme"
-    else:
-        long_ok=detect_core_conditions(df,i,1); short_ok=detect_core_conditions(df,i,-1)
-        strategy="Core"
-    price,_=live_price(sym); price=float(price or df["close"].iloc[-1])
-    # حماية من العملات الرخيصة جداً (shitcoins) — انزلاق سعري كارثي
-    if price < 0.000001:
-        raise NoData(sym)
-    trend=detect_trend(df,i); df_d=None
-    try:
-        df_d=get_candles(sym,"1d",250,ttl=300,min_bars=100); df_d=add_indicators(df_d,100)
-    except Exception as _ex: log.debug('ignored: %s', _ex)
-    bias_d=daily_bias(df_d) if df_d is not None else 0
-    # ---------- المحرك الدقيق (signal_engine) ----------
-    ed=_eng_df(df); ed_d=_eng_df(df_d) if df_d is not None else None
-    ed_h=None
-    if tf!="1h":
-        try: ed_h=_eng_df(get_candles(sym,"1h",250,ttl=300,min_bars=100))
-        except Exception: ed_h=None
-    cand=_sgn_i(se.trend_state(ed,len(ed)-1))
-    try: fut=futures_score_for(sym,cand) if cand else dict(score=0,details=[])
-    except Exception: fut=dict(score=0,details=[])
-    fut_score=fut.get("score",0)
-    deriv=derivatives_snapshot(sym)
-    ai_1h=ed_h
-    if ai_1h is None:
-        try: ai_1h=_eng_df(get_candles(sym,"1h",220,ttl=180,min_bars=80))
-        except Exception: ai_1h=None
-    ai_15m=None
-    try: ai_15m=_eng_df(get_candles(sym,"15m",220,ttl=120,min_bars=80))
-    except Exception: ai_15m=None
-    ai_context=adaptive_ai_context(sym,ai_1h,ai_15m,deriv)
-    funding=deriv.get("funding")
-    oi_data=deriv.get("oi")
-    oi_change=oi_data.get("change_pct") if isinstance(oi_data,dict) else None
-    ls_ratio=deriv.get("ls_ratio")
-    liq_data=deriv.get("liquidations")
-    try:
-        all_pats=[]; seen_names=set()
-        for pat_tf in ["1d","4h","1h"]:
-            try:
-                if pat_tf==tf: p_df=df
-                else:
-                    p_df=get_candles(sym,pat_tf,300,ttl=600,min_bars=100); p_df=add_indicators(p_df,100)
-                pats=detect_all_patterns(p_df,pat_tf)
-                for p in pats:
-                    key=f"{p['name']}"
-                    if key not in seen_names: seen_names.add(key); all_pats.append(p)
-            except Exception: continue
-        patterns=all_pats
-    except Exception: patterns=[]
-    btc_t=0
-    if sym!="BTC":
-        try: btc_t=btc_trend_cached()
-        except Exception: btc_t=0
-    ev=se.evaluate(ed,ed_d,ed_h,price=price,fut_score=fut_score,btc_trend=btc_t,patterns=patterns,
-                   funding=funding,oi_change=oi_change,ls_ratio=ls_ratio,liq_data=liq_data)
-    wait=(ev["status"]=="WAIT")
-    # ---- فلتر تعدد الأطر الزمنية الصارم (MTF)
-    # قبل قبول LONG على 4س: فريم الساعة يجب ألا يكون هابطاً قوياً (-2)
-    # قبل قبول SHORT: فريم الساعة يجب ألا يكون صاعداً قوياً (+2)
-    if not wait and ed_h is not None:
-        try:
-            h1_t = se.trend_state(ed_h, len(ed_h)-1)
-            if ev["side"] == 1 and h1_t == -2:
-                wait = True
-                ev = dict(ev)
-                ev["status"] = "WAIT"
-                ev.setdefault("wait_reasons", []).append("MTF: فريم الساعة هابط قوي (−2) — إلغاء LONG")
-            elif ev["side"] == -1 and h1_t == 2:
-                wait = True
-                ev = dict(ev)
-                ev["status"] = "WAIT"
-                ev.setdefault("wait_reasons", []).append("MTF: فريم الساعة صاعد قوي (+2) — إلغاء SHORT")
+            value = float(frame[col].iloc[-1])
+            return value if np.isfinite(value) else default
         except Exception:
-            pass
-    atr_now=float(ed["atr"].iloc[-1]) if not pd.isna(ed["atr"].iloc[-1]) else price*0.02
-    forced=False
-    if wait:
-        # البوت يعطي صفقة دائماً: إن لم تتحقق شروط الجودة تُعرض بدرجة C مع تحذير واضح
-        # (forced=True تمنع نشرها تلقائياً في القنوات وفي الفرصة الذهبية)
-        forced=True
-        side=cand
-        if not side and ed_d is not None: side=_sgn_i(se.trend_state(ed_d,len(ed_d)-1))
-        if not side: side=1 if price>=float(ed["ema50"].iloc[-1]) else -1
-        lv=None
-        try:
-            lv,_w=se.build_levels(ed,len(ed)-1,side,price,atr_now,ed_d,
-                                  (len(ed_d)-1) if ed_d is not None else None,
-                                  dict(se.CFG,max_sl_atr=4.0,min_rr_tp1=0.8))
-        except Exception: lv=None
-        if lv is None: lv=_hypo_levels(price,side,atr_now)
-        grade="C"; wait=False
+            return default
+
+    base = df_1h if df_1h is not None and len(df_1h) >= 60 else df
+    if base is None or len(base) < 60 or not price or price <= 0:
+        raise NoData(sym)
+
+    close = pd.to_numeric(base["close"], errors="coerce")
+    e20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
+    e50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
+    e100 = float(close.ewm(span=100, adjust=False).mean().iloc[-1])
+    ret4 = float(close.pct_change(4).iloc[-1] * 100) if len(close) > 5 else 0.0
+    ret12 = float(close.pct_change(12).iloc[-1] * 100) if len(close) > 13 else 0.0
+    rsi = last_num(base, "rsi", 50.0)
+    vol = pd.to_numeric(base["volume"], errors="coerce")
+    vmean = float(vol.rolling(20, min_periods=10).mean().iloc[-1])
+    rvol = float(vol.iloc[-1] / vmean) if vmean > 0 else 1.0
+    atr = last_num(base, "atr", price * 0.02)
+    atr = max(float(atr or price * 0.02), price * 0.002)
+
+    score = 0.0
+    # Trend structure (highest weight)
+    if e20 > e50 > e100: score += 2.0; reasons.append("اتجاه 1H صاعد: EMA20 فوق EMA50 وEMA100")
+    elif e20 < e50 < e100: score -= 2.0; reasons.append("اتجاه 1H هابط: EMA20 تحت EMA50 وEMA100")
+    elif e20 > e50: score += 1.0; reasons.append("ميل صاعد متوسط على 1H")
+    elif e20 < e50: score -= 1.0; reasons.append("ميل هابط متوسط على 1H")
+    factors["trend"] = round(score, 2)
+
+    # Momentum and shorter timeframe confirmation
+    momentum = 1 if ret4 > 0.15 and ret12 > 0 else (-1 if ret4 < -0.15 and ret12 < 0 else 0)
+    score += momentum * 1.25
+    if momentum: reasons.append("الزخم القصير يؤيد الشراء" if momentum > 0 else "الزخم القصير يؤيد البيع")
+    if df_15m is not None and len(df_15m) >= 30:
+        c15 = pd.to_numeric(df_15m["close"], errors="coerce")
+        r15 = float(c15.pct_change(4).iloc[-1] * 100)
+        if r15 > 0.10: score += 0.5; reasons.append("زخم 15m إيجابي")
+        elif r15 < -0.10: score -= 0.5; reasons.append("زخم 15m سلبي")
+        factors["momentum_15m_pct"] = round(r15, 3)
+    factors["momentum"] = momentum
+
+    # RSI is a context factor; extremes warn rather than veto.
+    if rsi >= 55: score += 0.5
+    elif rsi <= 45: score -= 0.5
+    if rsi >= 78: warnings.append("RSI مرتفع جداً؛ خطر مطاردة السعر")
+    elif rsi <= 22: warnings.append("RSI منخفض جداً؛ خطر البيع قرب تشبع بيعي")
+    factors["rsi"] = round(rsi, 1)
+
+    # Relative volume supports conviction but never fabricates direction.
+    if rvol >= 1.5: reasons.append(f"حجم تداول مرتفع نسبياً ×{rvol:.2f}")
+    elif rvol < 0.65: warnings.append(f"الحجم ضعيف ×{rvol:.2f}؛ الاختراقات أقل موثوقية")
+    factors["relative_volume"] = round(rvol, 2)
+
+    flow = (ai_context or {}).get("flow", {}) if isinstance(ai_context, dict) else {}
+    cvd = flow.get("cvd_imbalance")
+    book = flow.get("book_imbalance")
+    if cvd is not None:
+        cvd = float(cvd)
+        if cvd > 0.08: score += 0.75; reasons.append("CVD يميل إلى شراء السوق")
+        elif cvd < -0.08: score -= 0.75; reasons.append("CVD يميل إلى بيع السوق")
+        factors["cvd"] = round(cvd, 3)
     else:
-        side=ev["side"]; grade=ev["grade"]; lv=ev["lv"]
-    if lv is None: raise NoData(sym)
-    candle=detect_candle_pattern(df,i); sr_high,sr_low=find_sr_levels(df); fibs=fib_levels(df)
-    last=df.iloc[-1]
-    analysis_warnings=list(ev.get("warnings",[]))
+        warnings.append("CVD غير متاح؛ قرار التدفق ناقص")
+    if book is not None:
+        book = float(book)
+        if book > 0.15: score += 0.35; reasons.append("دفتر الأوامر يميل للطلبات")
+        elif book < -0.15: score -= 0.35; reasons.append("دفتر الأوامر يميل للعروض")
+        factors["orderbook"] = round(book, 3)
+
+    oi = deriv.get("oi") if isinstance(deriv, dict) else None
+    funding = deriv.get("funding") if isinstance(deriv, dict) else None
+    ls = deriv.get("ls_ratio") if isinstance(deriv, dict) else None
+    oi_change = oi.get("change_pct") if isinstance(oi, dict) else None
+    # Derivatives are contrarian/contextual; OI growth alone has no direction.
+    if funding is not None:
+        funding = float(funding)
+        if funding > 0.05: score -= 0.35; warnings.append("Funding موجب ومرتفع؛ ازدحام محتمل في مراكز الشراء")
+        elif funding < -0.05: score += 0.35; warnings.append("Funding سالب ومرتفع؛ ازدحام محتمل في مراكز البيع")
+        factors["funding_pct"] = round(funding, 4)
+    if ls is not None:
+        ls = float(ls)
+        if ls > 2.0: score -= 0.35; warnings.append("نسبة Long/Short مرتفعة؛ ازدحام Long محتمل")
+        elif ls < 0.5: score += 0.35; warnings.append("نسبة Long/Short منخفضة؛ ازدحام Short محتمل")
+        factors["long_short_ratio"] = round(ls, 3)
+    if oi_change is not None:
+        factors["oi_change_pct"] = round(float(oi_change), 2)
+        if abs(float(oi_change)) >= 5:
+            warnings.append(f"تغير Open Interest {float(oi_change):+.1f}%؛ لا يحدد الاتجاه وحده")
+
+    regime = (ai_context or {}).get("regime_1h", {}) if isinstance(ai_context, dict) else {}
+    regime_code = regime.get("code", "unknown")
+    if regime_code == "high_vol":
+        warnings.append("تقلبات مرتفعة؛ تم توسيع الوقف وتقليل الثقة التشغيلية")
+        atr = max(atr, price * 0.015)
+    elif regime_code == "range":
+        warnings.append("السوق عرضي؛ احتمال الاختراقات الكاذبة أعلى")
+    elif regime_code == "trend_up" and score < 0:
+        warnings.append("تصنيف النظام صاعد لكن بعض التدفقات/الزخم تعارضه")
+    elif regime_code == "trend_down" and score > 0:
+        warnings.append("تصنيف النظام هابط لكن بعض التدفقات/الزخم تعارضه")
+
+    side = 1 if score >= 0 else -1
+    aligned = sum(1 for x in (momentum, 1 if e20 > e50 else -1 if e20 < e50 else 0) if x == side)
+    opposing = sum(1 for x in (momentum, 1 if e20 > e50 else -1 if e20 < e50 else 0) if x == -side)
+    if abs(score) >= 3.5 and aligned >= 2 and rvol >= 0.8:
+        grade = "A"
+    elif abs(score) >= 2.0 and aligned >= 1:
+        grade = "B"
+    else:
+        grade = "C"
+        warnings.insert(0, "درجة C: الاتجاه المختار هو الأقل تعارضاً، لكن التأكيد ضعيف؛ مخاطرة مرتفعة")
+    if opposing:
+        warnings.append(f"يوجد {opposing} عامل/عوامل اتجاهية تعارض الصفقة")
+    if not reasons:
+        reasons.append("تم اختيار الاتجاه الأقل تعارضاً وفق البيانات المتاحة")
+    return dict(side=side, grade=grade, score=round(abs(score), 2),
+                reasons=reasons, warnings=warnings, factors=factors,
+                atr=atr, regime=regime, forced=(grade == "C"),
+                wait_reasons=list(warnings), confidence=None,
+                confidence_type="unavailable_not_calibrated",
+                strategy=("Adaptive Trend Rider" if aligned else "Liquidity/Flow fallback"))
+
+def analyze(sym):
+    tf = default_tf(sym)
+    df = get_candles(sym, tf, 450)
+    degraded = bool(df.attrs.get("degraded"))
+    df = add_indicators(df, 100)
+    i = len(df) - 1
+    price, _ = live_price(sym)
+    price = float(price or df["close"].iloc[-1])
+    if not np.isfinite(price) or price <= 0:
+        raise NoData(sym)
+
+    # Pull the same public market feeds for every symbol; missing optional feeds
+    # become warnings, not fabricated values.
+    df_d = None
+    try:
+        df_d = add_indicators(get_candles(sym, "1d", 250, ttl=300, min_bars=100), 100)
+    except Exception as _ex:
+        log.debug("daily context unavailable for %s: %s", sym, _ex)
+    df_1h = df if tf == "1h" else None
+    if df_1h is None:
+        try: df_1h = add_indicators(get_candles(sym, "1h", 250, ttl=180, min_bars=80), 80)
+        except Exception: df_1h = None
+    df_15m = None
+    try: df_15m = get_candles(sym, "15m", 220, ttl=120, min_bars=80)
+    except Exception: df_15m = None
+
+    deriv = derivatives_snapshot(sym)
+    ai_context = adaptive_ai_context(sym, df_1h, df_15m, deriv)
+    decision = _ryma_ai_decision(sym, df, df_1h, df_15m, price, deriv, ai_context)
+    side, grade = decision["side"], decision["grade"]
+    atr_now = float(decision["atr"])
+    # ATR-based targets are transparent and directionally valid. C setups receive
+    # wider caution messaging; no made-up model probability is shown.
+    risk_pct = 0.018 if decision["regime"].get("code") == "high_vol" else 0.012
+    risk = max(atr_now * (2.0 if grade == "C" else 1.6), price * risk_pct)
+    risk = min(risk, price * 0.08)
+    lv = _hypo_levels(price, side, max(risk / 1.5, price * 0.002))
+    lv["risk"] = float(risk)
+    lv["sl"] = float(price - side * risk)
+    lv["entry"] = float(price)
+    for j, tp in enumerate(lv["tps"]):
+        mult = (1.2, 2.0, 3.0, 4.0)[j]
+        tp["px"] = float(price + side * risk * mult)
+        if side < 0: tp["px"] = max(tp["px"], price * 0.05)
+        tp["pct"] = round(100 * side * (tp["px"] - price) / price, 3)
+    lv["atr"] = atr_now
+
+    trend = detect_trend(df, i)
+    bias_d = daily_bias(df_d) if df_d is not None else 0
+    candle = detect_candle_pattern(df, i)
+    sr_high, sr_low = find_sr_levels(df)
+    fibs = fib_levels(df)
+    patterns, seen_names = [], set()
+    for pat_tf in ("1d", "4h", "1h"):
+        try:
+            p_df = df if pat_tf == tf else add_indicators(
+                get_candles(sym, pat_tf, 300, ttl=600, min_bars=100), 100)
+            for pat in detect_all_patterns(p_df, pat_tf):
+                if pat["name"] not in seen_names:
+                    seen_names.add(pat["name"]); patterns.append(pat)
+        except Exception:
+            continue
     if degraded:
-        analysis_warnings.append("بيانات الشموع من مصدر Spot بديل؛ الأسعار قد تختلف عن العقود الآجلة")
-    return dict(sym=sym,tf=tf,df=df,side=side,strategy=strategy,
-                rank={"A+":3,"A":2,"B":1,"C":0}.get(grade,-1),grade=grade,setup=strategy,
-                ok=1 if grade in ("A+","A","B") else 0,total=4,
-                wait=wait,forced=forced,wait_reasons=ev.get("wait_reasons",[]),reasons=ev.get("reasons",[]),
-                warnings=analysis_warnings,score=ev.get("score",0.0),
-                confidence=ev.get("confidence",0),confidence_type=ev.get("confidence_type","confluence_index"),
-                watch=ev.get("watch"),trends=ev.get("trends",{}),
-                lv=lv,price=price,degraded=degraded,source=df.attrs.get("source","binance_fut"),
-                bar_t=int(last["t"]),rsi=float(last["rsi"]) if not pd.isna(last["rsi"]) else 50.0,
-                macd=float(last["macd"]) if not pd.isna(last["macd"]) else 0.0,
-                candle=candle,trend=trend,trend_d=("down" if bias_d==-1 else ("up" if bias_d==1 else "range")),
-                sr_high=sr_high[:3],sr_low=sr_low[:3],fibs=fibs,
-                fut_score=fut_score,fut_details=fut.get("details",[]),patterns=patterns,
-                factor_scores=ev.get("factor_scores",{}),
-                derivatives_status=deriv.get("source_status",{}),
-                ai_context=ai_context)
+        decision["warnings"].append("بيانات الشموع من مصدر Spot بديل؛ الأسعار قد تختلف عن العقود الآجلة")
+    fut = futures_score_for(sym, side)
+    return dict(
+        sym=sym, tf=tf, df=df, side=side, strategy=decision["strategy"],
+        rank={"A+":3,"A":2,"B":1,"C":0}.get(grade,0), grade=grade,
+        setup=decision["strategy"], ok=1 if grade in ("A+","A","B") else 0, total=4,
+        wait=False, forced=decision["forced"], wait_reasons=decision["wait_reasons"],
+        reasons=decision["reasons"], warnings=decision["warnings"],
+        score=decision["score"], confidence=None,
+        confidence_type=decision["confidence_type"], watch=None,
+        trends={"1h":decision["regime"].get("name","غير حاسم")},
+        lv=lv, price=price, degraded=degraded, source=df.attrs.get("source","binance_fut"),
+        bar_t=int(df.iloc[-1]["t"]), rsi=float(df.iloc[-1]["rsi"]) if pd.notna(df.iloc[-1]["rsi"]) else 50.0,
+        macd=float(df.iloc[-1]["macd"]) if pd.notna(df.iloc[-1]["macd"]) else 0.0,
+        candle=candle, trend=trend,
+        trend_d=("down" if bias_d==-1 else ("up" if bias_d==1 else "range")),
+        sr_high=sr_high[:3], sr_low=sr_low[:3], fibs=fibs,
+        fut_score=fut.get("score",0), fut_details=fut.get("details",[]),
+        patterns=patterns, factor_scores=decision["factors"],
+        derivatives_status=deriv.get("source_status",{}), ai_context=ai_context)
 
 def get_analysis(sym,force=False):
     if len(_analysis_cache)>300: _analysis_cache.clear()
@@ -3689,8 +3723,8 @@ def caption_core(res,tier="free",lang="ar"):
         if res.get("forced") or grade == "C":
             lines += ["",
                       "⚠️ <b>Grade C warning — low quality setup:</b>",
-                      "• Full engine conditions not met",
-                      "• Shown for analysis only (not auto-posted)",
+                      "• Several confirmation conditions are missing",
+                      "• Published as a high-risk C setup; confirmation is weak",
                       "• Use half normal risk size or less",
                       "• Invalidate immediately if stop is broken"]
             for r in res.get("wait_reasons", [])[:3]:
@@ -3733,8 +3767,8 @@ def caption_core(res,tier="free",lang="ar"):
     if res.get("forced") or grade == "C":
         lines += ["",
                   "⚠️ <b>تحذير درجة C — صفقة منخفضة الجودة:</b>",
-                  "• الشروط الكاملة للمحرك غير متحققة",
-                  "• تُعرض للتحليل فقط وليست توصية نشر تلقائي",
+                  "• بعض شروط التأكيد غير متحققة",
+                  "• تُنشر كإشارة C عالية المخاطر مع ضعف التأكيد",
                   "• استخدم نصف حجم المخاطرة المعتاد أو أقل",
                   "• راقب الإبطال فوراً إذا كسر الوقف"]
         for r in res.get("wait_reasons", [])[:3]:
@@ -4050,14 +4084,17 @@ async def run_autopost(bot):
     log.info("run_autopost: بدء المسح")
     syms=await asyncio.to_thread(top_symbols,60)
     results=await asyncio.to_thread(scan_sync,syms[:40])
-    cands=[r for r in results if r["rank"]>=0 and not r.get("forced") and r["sym"] not in WEAK_COINS and r["sym"] not in EXCLUDE_TICKERS]
+    cands=[r for r in results if r["rank"]>=0 and r["sym"] not in WEAK_COINS and r["sym"] not in EXCLUDE_TICKERS]
     cands.sort(key=lambda r:(-r["rank"],-r.get("ok",0)))
     today=dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
     if _free_day["d"]!=today: _free_day.update(d=today,n=0)
     a_candidates=[r for r in cands if r["grade"] in ("A+","A")]
     a_candidates.sort(key=lambda r:(-r.get("fut_score",0),-r["rank"]))
     b_candidates=[r for r in cands if r["grade"]=="B"]
-    vip_pool=a_candidates if a_candidates else b_candidates
+    c_candidates=[r for r in cands if r["grade"]=="C"]
+    # A/B are preferred; C is the explicit fallback so the signal is still issued
+    # with a prominent warning when no stronger setup is available.
+    vip_pool=a_candidates if a_candidates else (b_candidates if b_candidates else c_candidates)
     if len(active_signals())>=MAX_OPEN:
         log.warning(f"MAX_OPEN {len(active_signals())}/{MAX_OPEN}"); return dict(vip=0,free=0,total=0)
     vip_n=free_n=0; used=set()
@@ -5818,7 +5855,7 @@ async def cmd_scan(update,ctx):
     wait=await update.message.reply_text("⏳ فحص...")
     syms=await asyncio.to_thread(top_symbols,60,True)
     res=await asyncio.to_thread(scan_sync,syms[:30])
-    res=[r for r in res if r["rank"]>=0 and not r.get("forced")]; res.sort(key=lambda r:-r["rank"])
+    res=[r for r in res if r["rank"]>=0]; res.sort(key=lambda r:-r["rank"])
     if not res: await wait.edit_text("لا شيء"); return
     lines=["🎯 أفضل الإعدادات:",""]
     for r in res[:10]:
@@ -5834,7 +5871,7 @@ async def cmd_scan(update,ctx):
 async def cmd_short(update,ctx):
     wait=await update.message.reply_text("⏳...")
     res=await asyncio.to_thread(scan_sync,COINS)
-    res=[r for r in res if r["side"]==-1 and r["rank"]>=0 and not r.get("forced")]
+    res=[r for r in res if r["side"]==-1 and r["rank"]>=0]
     if not res: await wait.edit_text("لا شورت"); return
     lines=["🔻 فرص شورت:"]+[f"{r['grade']} | #{r['sym']} | 🎯 بيع" for r in res[:15]]
     await wait.edit_text("\n".join(lines),link_preview_options=NO_PREVIEW)
