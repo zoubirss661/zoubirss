@@ -4,6 +4,16 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np, pandas as pd, requests, ccxt, matplotlib
 import urllib.parse, concurrent.futures
 import types as _types
+# Optional adaptive-ML stack. Core bot remains available if not installed.
+try:
+    import joblib as _joblib
+except Exception:
+    _joblib = None
+try:
+    from sklearn.cluster import KMeans as _KMeans
+    from sklearn.preprocessing import StandardScaler as _StandardScaler
+except Exception:
+    _KMeans = _StandardScaler = None
 # ===================== محرك الإشارات الدقيق (مدمج) =====================
 # اتجاه يومي+4س، وقف هيكلي، أهداف من مستويات حقيقية، لا مطاردة، بدون repaint.
 ENG_TP_FRACS = [0.50, 0.25, 0.15, 0.10]
@@ -593,9 +603,16 @@ VIP_INVITE_LINK = _e("VIP_INVITE_LINK", "https://t.me/+gTMJiBiiC_IyZjZk")
 CONTACT_URL = f"https://t.me/{CONTACT_LINK.lstrip('@')}" if CONTACT_LINK else CHANNEL_LINK
 PAYMENT_INFO = _e("PAYMENT_INFO")
 PROTECT = _e("PROTECT_CONTENT", "1") == "1"
+# Adaptive AI layer (optional until a properly walk-forward-trained model is deployed)
+RYMA_AI_ENABLED = _e("RYMA_AI_ENABLED", "1") == "1"
+RYMA_ML_ENABLED = _e("RYMA_ML_ENABLED", "0") == "1"
+RYMA_ML_MODEL_PATH = _e("RYMA_ML_MODEL_PATH", "models/ryma_lgbm_calibrated.joblib")
+RYMA_ML_MIN_PROB = float(_e("RYMA_ML_MIN_PROB", "0.75"))
+RYMA_AI_CACHE_TTL = max(60, _int("RYMA_AI_CACHE_TTL", 300))
+RYMA_CVD_TRADES = max(100, min(1000, _int("RYMA_CVD_TRADES", 500)))
 MAINTENANCE = _e("MAINTENANCE", "0") == "1"
 BRAND = "💎 Ryma Crypto 💎"
-BOT_VERSION = "Ryma Crypto v5.0-rc3 · 2026-11-12"
+BOT_VERSION = "Ryma Crypto AI Signal v6.0-rc1 · 2026-11-17"
 # PRINCIPLE: alerts & analysis only — never places exchange orders
 CYCLE_RADAR = 300
 WHALE_MIN_USD = 500000
@@ -1360,6 +1377,177 @@ def derivatives_snapshot(sym, ttl=90):
         if len(_derivatives_snapshot_cache)>500: _derivatives_snapshot_cache.clear()
         _derivatives_snapshot_cache[sym]=(now,dict(data))
     return data
+
+# ===================== Adaptive AI / Order Flow context =====================
+_ai_context_cache = {}
+_ai_context_lock = threading.RLock()
+_ai_model_cache = {"path": None, "mtime": None, "model": None, "error": None}
+_AI_FEATURES = ["ret_1", "ret_4", "atr_pct", "rv_ratio", "ema_spread", "rsi", "cvd_imbalance", "oi_change_pct", "funding_pct", "book_imbalance"]
+
+def _ai_orderflow_snapshot(sym):
+    """Public futures tape + order-book snapshot. No trading endpoints are called."""
+    out = {"cvd_base": None, "taker_buy_base": None, "taker_sell_base": None,
+           "cvd_imbalance": None, "book_imbalance": None, "source": "binance_usdm"}
+    symbol = f"{clean_symbol(sym)}USDT"
+    try:
+        r = requests.get(f"{BINANCE_FAPI_BASE}/fapi/v1/aggTrades",
+                         params={"symbol": symbol, "limit": RYMA_CVD_TRADES}, timeout=8)
+        r.raise_for_status()
+        trades = r.json()
+        buy = sell = 0.0
+        for tr in trades:
+            q = float(tr.get("q", 0) or 0)
+            if tr.get("m"):
+                sell += q
+            else:
+                buy += q
+        total = buy + sell
+        if total > 0:
+            out.update(taker_buy_base=buy, taker_sell_base=sell,
+                       cvd_base=buy-sell, cvd_imbalance=(buy-sell)/total)
+    except Exception as ex:
+        out["tape_error"] = type(ex).__name__
+    try:
+        r = requests.get(f"{BINANCE_FAPI_BASE}/fapi/v1/depth",
+                         params={"symbol": symbol, "limit": 20}, timeout=8)
+        r.raise_for_status()
+        book = r.json()
+        bids = sum(float(x[1]) for x in book.get("bids", [])[:20])
+        asks = sum(float(x[1]) for x in book.get("asks", [])[:20])
+        if bids + asks > 0:
+            out["book_imbalance"] = (bids-asks)/(bids+asks)
+    except Exception as ex:
+        out["book_error"] = type(ex).__name__
+    return out
+
+
+def _ai_regime_from_df(df, timeframe):
+    """Rolling unsupervised KMeans regime; cluster labels mapped by volatility/trend.
+    Uses only completed candles supplied by get_candles()."""
+    result = {"name": "غير حاسم", "code": "unknown", "timeframe": timeframe,
+              "method": "statistical_fallback", "trend_strength": None, "volatility_ratio": None}
+    if df is None or len(df) < 80:
+        return result
+    try:
+        x = df.copy().tail(180).reset_index(drop=True)
+        close = pd.to_numeric(x["close"], errors="coerce")
+        high = pd.to_numeric(x["high"], errors="coerce")
+        low = pd.to_numeric(x["low"], errors="coerce")
+        ret = close.pct_change()
+        atr = (high-low).rolling(14, min_periods=10).mean()/close.replace(0, np.nan)
+        ema20 = close.ewm(span=20, adjust=False).mean()
+        ema50 = close.ewm(span=50, adjust=False).mean()
+        trend = (ema20-ema50)/close.replace(0, np.nan)
+        vol = ret.rolling(20, min_periods=10).std()
+        feat = pd.DataFrame({"trend":trend, "vol":vol, "atr":atr}).replace([np.inf,-np.inf],np.nan).dropna()
+        if len(feat) < 50:
+            return result
+        cur=feat.iloc[-1]
+        vol_base=float(feat["vol"].rolling(80,min_periods=30).median().iloc[-1])
+        vr=float(cur["vol"]/vol_base) if vol_base and np.isfinite(vol_base) else 1.0
+        tr=float(cur["trend"])
+        result.update(trend_strength=round(tr*100,3),volatility_ratio=round(vr,2))
+        # KMeans is used when sklearn exists; use the current cluster's centroid
+        # plus explicit volatility mapping, not arbitrary numeric cluster IDs.
+        if _KMeans is not None and _StandardScaler is not None:
+            mat=feat.to_numpy(dtype=float)
+            scaler=_StandardScaler()
+            z=scaler.fit_transform(mat)
+            km=_KMeans(n_clusters=3, random_state=17, n_init=10, max_iter=150)
+            labels=km.fit_predict(z)
+            label=int(labels[-1]); members=feat.iloc[np.where(labels==label)[0]]
+            centroid=members.mean()
+            cvol=float(centroid["vol"])
+            ctrend=float(centroid["trend"])
+            # Identify high-vol cluster by volatility rank; trend/range by centroid slope.
+            cluster_vols=[float(feat.iloc[np.where(labels==j)[0]]["vol"].mean()) for j in range(3)]
+            if cvol >= sorted(cluster_vols)[-1] * 0.92 and vr >= 1.35:
+                code,name="high_vol","تقلبات مرتفعة"
+            elif abs(ctrend) >= max(float(feat["trend"].abs().quantile(.65)),0.0015):
+                code,name=("trend_up","اتجاه قوي صاعد") if ctrend>0 else ("trend_down","اتجاه قوي هابط")
+            else:
+                code,name="range","عرضي"
+            result["method"]="kmeans_rolling"
+        else:
+            if vr>=1.8: code,name="high_vol","تقلبات مرتفعة"
+            elif abs(tr)>=0.002: code,name=("trend_up","اتجاه قوي صاعد") if tr>0 else ("trend_down","اتجاه قوي هابط")
+            else: code,name="range","عرضي"
+        result.update(code=code,name=name)
+    except Exception as ex:
+        result["error"]=type(ex).__name__
+    return result
+
+
+def _ai_predict_probability(features):
+    """Only returns probability from an explicitly deployed calibrated model."""
+    if not RYMA_ML_ENABLED or _joblib is None or not os.path.isfile(RYMA_ML_MODEL_PATH):
+        return None, "model_not_configured"
+    try:
+        mtime=os.path.getmtime(RYMA_ML_MODEL_PATH)
+        if (_ai_model_cache["model"] is None or _ai_model_cache["path"]!=RYMA_ML_MODEL_PATH
+                or _ai_model_cache["mtime"]!=mtime):
+            model=_joblib.load(RYMA_ML_MODEL_PATH)
+            _ai_model_cache.update(path=RYMA_ML_MODEL_PATH,mtime=mtime,model=model,error=None)
+        model=_ai_model_cache["model"]
+        row=np.array([[float(features.get(k,0.0) or 0.0) for k in _AI_FEATURES]],dtype=float)
+        proba=model.predict_proba(row)[0]
+        classes=list(getattr(model,"classes_",[0,1]))
+        pos_idx=classes.index(1) if 1 in classes else len(proba)-1
+        return float(proba[pos_idx]), "calibrated_model"
+    except Exception as ex:
+        _ai_model_cache["error"]=f"{type(ex).__name__}: {str(ex)[:120]}"
+        return None, "model_error"
+
+
+def adaptive_ai_context(sym, df_1h=None, df_15m=None, deriv=None):
+    """Market regime + derivatives/tape features; never fabricates ML confidence."""
+    now=time.time(); key=clean_symbol(sym)
+    with _ai_context_lock:
+        hit=_ai_context_cache.get(key)
+        if hit and now-hit[0] < RYMA_AI_CACHE_TTL:
+            return dict(hit[1])
+    if deriv is None: deriv=derivatives_snapshot(sym)
+    oi=deriv.get("oi") if isinstance(deriv,dict) else None
+    oi_pct=oi.get("change_pct") if isinstance(oi,dict) else None
+    funding=deriv.get("funding") if isinstance(deriv,dict) else None
+    flow=_ai_orderflow_snapshot(sym) if RYMA_AI_ENABLED else {}
+    r1=_ai_regime_from_df(df_1h,"1h")
+    r15=_ai_regime_from_df(df_15m,"15m")
+    df=df_1h if df_1h is not None and len(df_1h)>55 else df_15m
+    feat={k:0.0 for k in _AI_FEATURES}
+    try:
+        if df is not None and len(df)>=55:
+            c=pd.to_numeric(df["close"],errors="coerce")
+            h=pd.to_numeric(df["high"],errors="coerce"); l=pd.to_numeric(df["low"],errors="coerce")
+            ret1=float(c.pct_change().iloc[-1]*100); ret4=float(c.pct_change(4).iloc[-1]*100)
+            atrp=float((h-l).rolling(14).mean().iloc[-1]/c.iloc[-1]*100)
+            rv=float(c.pct_change().rolling(20).std().iloc[-1])
+            e20=float(c.ewm(span=20,adjust=False).mean().iloc[-1]); e50=float(c.ewm(span=50,adjust=False).mean().iloc[-1])
+            rsi=float(add_indicators(df.copy(),50)["rsi"].iloc[-1])
+            vol=pd.to_numeric(df["volume"],errors="coerce")
+            rv_ratio=float(vol.iloc[-1]/vol.rolling(20,min_periods=10).mean().iloc[-1])
+            feat.update(ret_1=ret1,ret_4=ret4,atr_pct=atrp,rv_ratio=rv_ratio,
+                        ema_spread=(e20-e50)/c.iloc[-1]*100,rsi=rsi)
+    except Exception: pass
+    feat.update(cvd_imbalance=float(flow.get("cvd_imbalance") or 0),
+                oi_change_pct=float(oi_pct or 0),funding_pct=float(funding or 0),
+                book_imbalance=float(flow.get("book_imbalance") or 0))
+    prob,model_status=_ai_predict_probability(feat)
+    out={"enabled":RYMA_AI_ENABLED,"regime_1h":r1,"regime_15m":r15,
+         "flow":flow,"features":feat,"ml_probability":prob,
+         "ml_probability_pct":round(prob*100,1) if prob is not None else None,
+         "ml_status":model_status,"signal_threshold":RYMA_ML_MIN_PROB,
+         "signal_eligible":bool(prob is not None and prob>=RYMA_ML_MIN_PROB),
+         "confidence_is_calibrated":bool(prob is not None),
+         "notes":[]}
+    if prob is None: out["notes"].append("لا يوجد نموذج احتمالي معاير منشور؛ لا تُعرض نسبة ثقة AI")
+    if flow.get("cvd_imbalance") is None: out["notes"].append("بيانات CVD غير متاحة حالياً")
+    if flow.get("book_imbalance") is None: out["notes"].append("بيانات دفتر الأوامر غير متاحة حالياً")
+    with _ai_context_lock:
+        if len(_ai_context_cache)>500: _ai_context_cache.clear()
+        _ai_context_cache[key]=(now,out)
+    return out
+
 
 def market_regime_snapshot():
     """BTC-led market regime; descriptive context, not a standalone trade signal."""
@@ -2323,92 +2511,6 @@ def engine_direction(sym, price=None):
         return 0
 
 
-
-def eng_radar_context(sym, side, price, df_1h=None):
-    """
-    يجمع تأكيدات الرادارات دون استدعاء engine_direction (لتجنب recursion).
-    كل شموع get_candles مغلقة مسبقاً عبر _rows_to_df.
-    النتائج معلومات مساعدة ولا تغيّر اتجاه الصفقة وحدها.
-    """
-    out = {"score": 0.0, "reasons": [], "warnings": [], "signals": {},
-           "timeframes": {"bias": "4h", "trigger": "1h", "entry": "15m"}}
-    try:
-        # 1H liquidity sweep: wick takes prior range then candle closes back inside.
-        h1 = df_1h
-        if h1 is None or len(h1) < 25:
-            h1 = get_candles(sym, "1h", 80, ttl=120, min_bars=30)
-        if h1 is not None and len(h1) >= 25:
-            x = h1.iloc[-1]
-            prev = h1.iloc[-21:-1]
-            prior_hi, prior_lo = float(prev["high"].max()), float(prev["low"].min())
-            swept_high = float(x["high"]) > prior_hi and float(x["close"]) < prior_hi
-            swept_low = float(x["low"]) < prior_lo and float(x["close"]) > prior_lo
-            if side == -1 and swept_high:
-                out["score"] += 1.25
-                out["reasons"].append("1H: سحب سيولة فوق القمم ثم إغلاق عائد أسفلها")
-                out["signals"]["h1_sweep"] = "bearish"
-            elif side == 1 and swept_low:
-                out["score"] += 1.25
-                out["reasons"].append("1H: سحب سيولة أسفل القيعان ثم إغلاق عائد فوقها")
-                out["signals"]["h1_sweep"] = "bullish"
-
-        # 15M FVG: three-candle imbalance, used as an entry-area clue only.
-        m15 = get_candles(sym, "15m", 100, ttl=90, min_bars=35)
-        if m15 is not None and len(m15) >= 3:
-            a, b, c = m15.iloc[-3], m15.iloc[-2], m15.iloc[-1]
-            if side == 1 and float(c["low"]) > float(a["high"]):
-                lo, hi = float(a["high"]), float(c["low"])
-                out["score"] += 0.65
-                out["reasons"].append("15M: فجوة قيمة عادلة صاعدة؛ راقب إعادة الاختبار")
-                out["signals"]["m15_fvg"] = {"side": "bullish", "low": lo, "high": hi}
-            elif side == -1 and float(c["high"]) < float(a["low"]):
-                lo, hi = float(c["high"]), float(a["low"])
-                out["score"] += 0.65
-                out["reasons"].append("15M: فجوة قيمة عادلة هابطة؛ راقب إعادة الاختبار")
-                out["signals"]["m15_fvg"] = {"side": "bearish", "low": lo, "high": hi}
-
-            # Relative volume is confirmation, not an independent direction signal.
-            vols = m15["volume"].iloc[-21:-1]
-            base = float(vols.mean()) if len(vols) else 0.0
-            vr = float(m15["volume"].iloc[-1]) / base if base > 0 else 0.0
-            out["signals"]["m15_rvol"] = round(vr, 2)
-            if vr >= 1.8:
-                out["score"] += 0.4
-                out["reasons"].append("15M: حجم تداول أعلى من المتوسط ×%.2f" % vr)
-            elif 0 < vr < 0.65:
-                out["warnings"].append("حجم 15M ضعيف؛ التأكيد غير مكتمل")
-
-        # Existing radar outputs, sampled conservatively and never treated as standalone entries.
-        try:
-            exp = explosion_radar(sym)
-            if exp:
-                out["signals"]["explosion"] = exp
-                if float(exp.get("price_change", 0)) * side > 0 and float(exp.get("vol_ratio", 0)) >= 1.5:
-                    out["score"] += 0.35
-                    out["reasons"].append("رادار Explosion: الحجم والزخم يدعمان الاتجاه")
-        except Exception:
-            pass
-        try:
-            liq = liquidity_radar(sym) if side in (-1, 1) else None
-            if liq:
-                out["signals"]["liquidity"] = liq
-                imbalance = (float(liq.get("ratio", 0.5)) - 0.5) * 2
-                if side * imbalance >= 0.18:
-                    out["score"] += 0.35
-                    out["reasons"].append("رادار السيولة: دفتر الطلبات يميل لصالح الاتجاه")
-                elif side * imbalance <= -0.35:
-                    out["warnings"].append("رادار السيولة يعاكس الاتجاه؛ انتبه لاحتمال ضعف التنفيذ")
-        except Exception:
-            pass
-
-        # Clamp radar contribution to prevent multiple correlated feeds dominating the core model.
-        out["score"] = round(max(-0.5, min(2.0, out["score"])), 2)
-    except Exception as exc:
-        log.debug("eng_radar_context %s: %s", sym, exc)
-        out["warnings"].append("تعذر إكمال بعض فحوص الرادارات")
-    return out
-
-
 def analyze(sym):
     tf=default_tf(sym); df=None; last_err=None
     fallbacks=[tf]+[x for x in ("1h","4h","1d") if x!=tf]
@@ -2447,6 +2549,14 @@ def analyze(sym):
     except Exception: fut=dict(score=0,details=[])
     fut_score=fut.get("score",0)
     deriv=derivatives_snapshot(sym)
+    ai_1h=ed_h
+    if ai_1h is None:
+        try: ai_1h=_eng_df(get_candles(sym,"1h",220,ttl=180,min_bars=80))
+        except Exception: ai_1h=None
+    ai_15m=None
+    try: ai_15m=_eng_df(get_candles(sym,"15m",220,ttl=120,min_bars=80))
+    except Exception: ai_15m=None
+    ai_context=adaptive_ai_context(sym,ai_1h,ai_15m,deriv)
     funding=deriv.get("funding")
     oi_data=deriv.get("oi")
     oi_change=oi_data.get("change_pct") if isinstance(oi_data,dict) else None
@@ -2511,24 +2621,16 @@ def analyze(sym):
     else:
         side=ev["side"]; grade=ev["grade"]; lv=ev["lv"]
     if lv is None: raise NoData(sym)
-    # تأكيدات رادارية متعددة الأطر بعد حسم اتجاه التقرير النهائي.
-    radar_ctx = eng_radar_context(sym, side, price,
-                                  df_1h=(get_candles(sym, "1h", 250, ttl=300, min_bars=100)
-                                         if tf != "1h" else df))
-    if forced:
-        radar_ctx["warnings"].append("الرادارات هنا معلومات مراقبة فقط؛ الإعداد الأساسي لم يكتمل")
     candle=detect_candle_pattern(df,i); sr_high,sr_low=find_sr_levels(df); fibs=fib_levels(df)
     last=df.iloc[-1]
-    analysis_warnings=list(ev.get("warnings",[])) + list(radar_ctx.get("warnings", []))
-    analysis_reasons=list(ev.get("reasons",[])) + list(radar_ctx.get("reasons", []))
+    analysis_warnings=list(ev.get("warnings",[]))
     if degraded:
         analysis_warnings.append("بيانات الشموع من مصدر Spot بديل؛ الأسعار قد تختلف عن العقود الآجلة")
     return dict(sym=sym,tf=tf,df=df,side=side,strategy=strategy,
                 rank={"A+":3,"A":2,"B":1,"C":0}.get(grade,-1),grade=grade,setup=strategy,
                 ok=1 if grade in ("A+","A","B") else 0,total=4,
-                wait=wait,forced=forced,wait_reasons=ev.get("wait_reasons",[]),reasons=analysis_reasons,
-                warnings=analysis_warnings,score=round(float(ev.get("score",0.0)) + float(radar_ctx.get("score",0.0)), 2),
-                radar_context=radar_ctx,
+                wait=wait,forced=forced,wait_reasons=ev.get("wait_reasons",[]),reasons=ev.get("reasons",[]),
+                warnings=analysis_warnings,score=ev.get("score",0.0),
                 confidence=ev.get("confidence",0),confidence_type=ev.get("confidence_type","confluence_index"),
                 watch=ev.get("watch"),trends=ev.get("trends",{}),
                 lv=lv,price=price,degraded=degraded,source=df.attrs.get("source","binance_fut"),
@@ -2538,7 +2640,8 @@ def analyze(sym):
                 sr_high=sr_high[:3],sr_low=sr_low[:3],fibs=fibs,
                 fut_score=fut_score,fut_details=fut.get("details",[]),patterns=patterns,
                 factor_scores=ev.get("factor_scores",{}),
-                derivatives_status=deriv.get("source_status",{}))
+                derivatives_status=deriv.get("source_status",{}),
+                ai_context=ai_context)
 
 def get_analysis(sym,force=False):
     if len(_analysis_cache)>300: _analysis_cache.clear()
@@ -3595,6 +3698,14 @@ def caption_core(res,tier="free",lang="ar"):
             for w in res.get("warnings", [])[:2]:
                 lines.append(f"  ⚡ {w}")
         lines+=["","━━━━━━━━━━━━━━━━",f"🎯 <b>Expected Decision: {decision}</b>"]
+        ai=res.get("ai_context") or {}
+        if ai:
+            rg=ai.get("regime_1h",{}); prob=ai.get("ml_probability_pct")
+            lines += ["",f"🧠 <b>AI Market Regime (1H):</b> {rg.get('name','unknown')}"]
+            lines.append(f"📊 <b>Calibrated ML probability:</b> {prob:.1f}%" if prob is not None else "🧪 <b>ML probability:</b> unavailable — calibrated model not configured")
+            flow=ai.get("flow",{}); cvd=flow.get("cvd_imbalance"); book=flow.get("book_imbalance")
+            if cvd is not None: lines.append(f"🌊 CVD imbalance: {cvd*100:+.1f}%")
+            if book is not None: lines.append(f"📚 Order book imbalance: {book*100:+.1f}%")
         lines+=["",RISK_WARNING_EN,f"👤 {BRAND}"]
         return "\n".join(lines)
         
@@ -3631,6 +3742,14 @@ def caption_core(res,tier="free",lang="ar"):
         for w in res.get("warnings", [])[:2]:
             lines.append(f"  ⚡ {w}")
     lines+=["","━━━━━━━━━━━━━━━━",f"🎯 <b>القرار المتوقع: {decision}</b>"]
+    ai=res.get("ai_context") or {}
+    if ai:
+        rg=ai.get("regime_1h",{}); prob=ai.get("ml_probability_pct")
+        lines += ["",f"🧠 <b>نظام السوق AI (1H):</b> {rg.get('name','غير حاسم')}"]
+        lines.append(f"📊 <b>احتمال النموذج المعاير:</b> {prob:.1f}%" if prob is not None else "🧪 <b>احتمال AI:</b> غير متاح — لم يتم إعداد نموذج معاير")
+        flow=ai.get("flow",{}); cvd=flow.get("cvd_imbalance"); book=flow.get("book_imbalance")
+        if cvd is not None: lines.append(f"🌊 اختلال CVD: {cvd*100:+.1f}%")
+        if book is not None: lines.append(f"📚 اختلال دفتر الأوامر: {book*100:+.1f}%")
     lines+=["",RISK_WARNING_AR,f"👤 {BRAND}"]
     return "\n".join(lines)
 
@@ -6290,14 +6409,13 @@ async def log_updates(update,ctx):
     q=update.callback_query
     if q: log.info("🔘 callback %s من %s",q.data,q.from_user.id)
 
-async def cmd_version(update, ctx):
-    """عرض نسخة البوت الفعلية التي تعمل من هذا الملف."""
-    text = (
-        f"💎 {BRAND}\n"
-        f"الإصدار: {BOT_VERSION}\n"
-        "الوضع: تنبيهات وتحليل فقط — لا ينفّذ أوامر تداول."
+async def cmd_version(update,ctx):
+    if not update.message: return
+    ai_state = "مفعّل" if RYMA_AI_ENABLED else "متوقف"
+    ml_state = "مفعّل" if RYMA_ML_ENABLED and os.path.isfile(RYMA_ML_MODEL_PATH) else "غير مهيأ"
+    await update.message.reply_text(
+        f"💎 Ryma Crypto\nالإصدار: {BOT_VERSION}\nطبقة AI: {ai_state}\nنموذج ML: {ml_state}\nالتنفيذ الآلي: معطّل (تنبيهات فقط)"
     )
-    await update.effective_message.reply_text(text)
 
 
 async def cmd_botinfo(update,ctx):
@@ -6749,7 +6867,7 @@ def main():
     store.start_flusher()
     app=(ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build())
     handlers=[
-        ("start",cmd_start),("help",cmd_help),("version",cmd_version),("myid",cmd_myid),("vip",cmd_vip),
+        ("version",cmd_version),("start",cmd_start),("help",cmd_help),("myid",cmd_myid),("vip",cmd_vip),
         ("menu",cmd_menu),("daily",cmd_daily),("cross",cmd_cross),("predict",cmd_predict),
         ("forcepost",cmd_forcepost),("clearsignals",cmd_clearsignals),
         ("smartcleanup",cmd_smartcleanup),("debug",cmd_debug),("health",cmd_health),("regime",cmd_regime),("smartmoney",cmd_smartmoney),("active",cmd_active),
