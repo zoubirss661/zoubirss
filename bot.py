@@ -612,7 +612,7 @@ RYMA_AI_CACHE_TTL = max(60, _int("RYMA_AI_CACHE_TTL", 300))
 RYMA_CVD_TRADES = max(100, min(1000, _int("RYMA_CVD_TRADES", 500)))
 MAINTENANCE = _e("MAINTENANCE", "0") == "1"
 BRAND = "💎 Ryma Crypto 💎"
-BOT_VERSION = "Ryma Crypto AI Signal v6.0-rc1 · 2026-11-17"
+BOT_VERSION = "Ryma Crypto AI Signal v7.0-rc2 · 2026-11-18"
 # PRINCIPLE: alerts & analysis only — never places exchange orders
 CYCLE_RADAR = 300
 WHALE_MIN_USD = 500000
@@ -4110,14 +4110,18 @@ async def run_autopost(bot):
         if any(x in ("VIP","FREE") for x in sent):
             _mark_posted(r); vip_n+=1; used.add(r["sym"]); await asyncio.sleep(1.0)
     if vip_n==0:
-        for r in [x for x in b_candidates if x["sym"] not in used]:
+        # Keep C as a genuine fallback for VIP: never silently drop it due to grade.
+        fallback_pool = [x for x in (b_candidates + c_candidates) if x["sym"] not in used]
+        for r in fallback_pool:
             if vip_n>=2: break
             if not _can_post(r): continue
             try: sent=await publish(bot,r,vip=True,free=False,admin_copy=False)
             except Exception: continue
             if any(x in ("VIP","FREE") for x in sent):
                 _mark_posted(r); vip_n+=1; used.add(r["sym"]); await asyncio.sleep(1.0)
-    for r in [x for x in b_candidates if x["sym"] not in used]:
+    # Free feed also falls back to C after all B candidates have been considered.
+    free_pool = [x for x in (b_candidates + c_candidates) if x["sym"] not in used]
+    for r in free_pool:
         if free_n>=FREE_POSTS_PER_CYCLE or _free_day["n"]>=FREE_MAX_PER_DAY: break
         if not _can_post(r): continue
         try: sent=await publish(bot,r,vip=False,free=True,admin_copy=False)
