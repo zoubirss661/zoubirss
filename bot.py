@@ -73,7 +73,7 @@ RYMA_AI_MAX_TOKENS = max(300, min(3000, _int("RYMA_AI_MAX_TOKENS", 600)))
 RYMA_AI_MIN_INTERVAL = max(5, _int("RYMA_AI_MIN_INTERVAL", 8))
 RYMA_AI_DAILY_CALL_CAP = max(1, _int("RYMA_AI_DAILY_CALL_CAP", 20))
 RYMA_AI_USAGE_PATH = _e("RYMA_AI_USAGE_PATH", "/app/ryma_ai_usage.json")
-RYMA_AI_BACKTEST_MAX_CALLS = max(10, min(3000, _int("RYMA_AI_BACKTEST_MAX_CALLS", 60)))
+RYMA_AI_BACKTEST_MAX_CALLS = max(100, min(3000, _int("RYMA_AI_BACKTEST_MAX_CALLS", 1200)))
 RYMA_AI_TEMPERATURE = 0.1
 RYMA_ML_ENABLED = True  # local model is the primary decision engine
 RYMA_ML_MODEL_PATH = "models/ryma_local_model.joblib"
@@ -83,7 +83,7 @@ RYMA_AI_DECISION_CACHE_TTL = max(300, _int("RYMA_AI_DECISION_CACHE_TTL", 21600))
 RYMA_CVD_TRADES = max(100, min(1000, _int("RYMA_CVD_TRADES", 500)))
 MAINTENANCE = _e("MAINTENANCE", "0") == "1"
 BRAND = "💎 Ryma Crypto 💎"
-BOT_VERSION = "Ryma Crypto Local ML v9.1 · 2026-11-18"
+BOT_VERSION = "Ryma Crypto v9.3 Exit-Parity Research · 2026-11-18"
 # PRINCIPLE: alerts & analysis only — never places exchange orders
 CYCLE_RADAR = 900
 WHALE_MIN_USD = 500000
@@ -1671,8 +1671,8 @@ def _ai_chat_completion(system_prompt, user_payload):
 def _risk_guard_levels(price, atr, side, proposed_sl=None, proposed_tps=None):
     """Deterministic safety validation only; never chooses trade direction."""
     price=float(price); atr=max(float(atr or 0),price*0.001)
-    max_risk=price*0.03
-    min_risk=max(price*0.003,atr*0.65)
+    max_risk=price*0.035
+    min_risk=max(price*0.0045,atr*1.50)
     try: sl=float(proposed_sl)
     except Exception: sl=price-side*min(atr*1.5,max_risk)
     risk=side*(price-sl)
@@ -1688,7 +1688,7 @@ def _risk_guard_levels(price, atr, side, proposed_sl=None, proposed_tps=None):
             if np.isfinite(px) and dist>0 and (side==1 or px>0): clean.append(px)
         except Exception: continue
     clean=sorted(set(clean),key=lambda x:side*(x-price))[:4]
-    rr=(1.5,2.5,3.5,5.0)
+    rr=(1.0,1.8,2.8,4.0)
     guarded=[]
     for idx in range(4):
         minimum=price+side*risk*(rr[idx] if idx==0 else 0.75*idx+1.0)
@@ -1701,7 +1701,7 @@ def _risk_guard_levels(price, atr, side, proposed_sl=None, proposed_tps=None):
         if side==-1: px=max(px,price*0.01)
         guarded.append(float(px))
     clean=guarded
-    fracs=(0.50,0.25,0.15,0.10)
+    fracs=(0.35,0.30,0.20,0.15)
     return {"entry":price,"sl":sl,"risk":risk,"atr":atr,
             "tps":[{"px":float(px),"pct":round(100*side*(px-price)/price,3),
                     "frac":fracs[i],"hit":False,"src":"AI"} for i,px in enumerate(clean)]}
@@ -1746,13 +1746,13 @@ def _ryma_local_ml_decision(sym, df, price, ai_context):
         setup="Temporary indicator fallback"
     # Closer, volatility-aware targets: aim for reachable partial exits rather
     # than distant 1.5R..5R levels. Keep a minimum distance above estimated costs.
-    risk=min(max(atr*1.20,float(price)*0.003),float(price)*0.03)
+    risk=min(max(atr*1.50,float(price)*0.0045),float(price)*0.035)
     sl=float(price)-side*risk
-    rr=(0.80,1.20,1.65,2.20)
+    rr=(1.0,1.8,2.8,4.0)
     targets=[float(price)+side*risk*x for x in rr]
     lv={"entry":float(price),"sl":sl,"risk":risk,"atr":atr,
         "tps":[{"px":px,"pct":round(100*side*(px-float(price))/float(price),3),
-                "frac":f,"hit":False,"src":"LOCAL_ML"} for px,f in zip(targets,(.50,.25,.15,.10))]}
+                "frac":f,"hit":False,"src":"LOCAL_ML"} for px,f in zip(targets,(.35,.30,.20,.15))]}
     return {"side":side,"grade":grade,"score":{"A":3,"B":2,"C":1}[grade],
             "reasons":reasons,"warnings":warnings,"factors":{"local_model":model_name,
             "prob_up":distribution.get(1) if distribution else None,
@@ -3647,8 +3647,59 @@ def _historical_ml_features_4h(hist):
     return {k:(float(x) if np.isfinite(x) else 0.0) for k,x in feat.items()}
 
 
+def _backtest_manage_trade(prepared, entry_i, side, entry, risk, atr_at_signal):
+    """Mirror live trade_step on 4h bars; conservative stop-before-target collision handling."""
+    sl=float(entry)-int(side)*float(risk)
+    tps=[float(entry)+int(side)*float(risk)*r for r in (1.0,1.8,2.8,4.0)]
+    fracs=(0.35,0.30,0.20,0.15)
+    remaining=1.0; realized=0.0; hit=0; be=False; trail_on=False
+    ext=float(entry); exit_kind="TIME"; exit_i=min(len(prepared)-1,entry_i+5)
+    for j in range(entry_i,min(len(prepared),entry_i+6)):
+        hi=float(prepared["high"].iloc[j]); lo=float(prepared["low"].iloc[j])
+        op=float(prepared["open"].iloc[j]); cl=float(prepared["close"].iloc[j])
+        stop_hit=(lo<=sl if side==1 else hi>=sl)
+        if stop_hit:
+            fill=min(op,sl) if side==1 else max(op,sl)
+            realized+=remaining*side*(fill-entry)/risk
+            exit_kind="TRAIL" if trail_on else ("BE" if be else "SL")
+            exit_i=j; remaining=0.0; break
+        # Match live ordering: process targets, then move stop; a newly moved stop
+        # becomes active from the next candle, not retroactively in this candle.
+        for k,tp in enumerate(tps):
+            if k<hit: continue
+            touched=(hi>=tp if side==1 else lo<=tp)
+            if touched:
+                realized+=fracs[k]*side*(tp-entry)/risk
+                remaining-=fracs[k]; hit+=1
+            else:
+                break
+        exit_i=j
+        if remaining<=1e-9:
+            exit_kind="TP"; remaining=0.0; break
+        if hit>=1 and not be:
+            sl=max(sl,entry+side*0.05*risk) if side==1 else min(sl,entry+side*0.05*risk)
+            be=True
+        ext=max(ext,hi) if side==1 else min(ext,lo)
+        if hit>=2:
+            trail_on=True
+            atr=float(prepared["atr"].iloc[j]) if "atr" in prepared.columns else float(atr_at_signal)
+            if np.isfinite(atr) and atr>0:
+                candidate=ext-side*2.0*atr
+                sl=max(sl,candidate) if side==1 else min(sl,candidate)
+        if j>=entry_i+5 and remaining>0:
+            realized+=remaining*side*(cl-entry)/risk
+            remaining=0.0; exit_kind="TIME"; exit_i=j; break
+    if remaining>0:
+        cl=float(prepared["close"].iloc[exit_i])
+        realized+=remaining*side*(cl-entry)/risk
+    # Entry is already slipped in the simulated fill; charge both-side fees and
+    # the exit-side slippage here, matching the backtest's fill convention.
+    cost=(2*FEE+SLIP)*entry/risk
+    return round(realized-cost,4),round(realized,4),hit,exit_kind,exit_i,cost
+
+
 def backtest_symbol(sym, years=3.0):
-    """Historical 4h replay: ML sees only features available at each completed 4h close."""
+    """4h historical replay with live-matched exits; decision samples capped for runtime."""
     years=float(years); years=min(max(years,0.1),10.0)
     need=int(years*6*365)+300
     rows=binance_futures_klines_long(sym,"4h",need)
@@ -3660,7 +3711,7 @@ def backtest_symbol(sym, years=3.0):
     stride=max(1,int(np.ceil((n-start)/RYMA_AI_BACKTEST_MAX_CALLS)))
     trades=[]; i=start; calls=0
     while i<n-2 and calls<RYMA_AI_BACKTEST_MAX_CALLS:
-        hist=prepared.iloc[:i+1].copy()
+        hist=prepared.iloc[:i+1]
         price=float(hist["close"].iloc[-1])
         try:
             historical_context={"backtest_mode":True,
@@ -3669,42 +3720,23 @@ def backtest_symbol(sym, years=3.0):
                 "note":"Only features available up to this completed 4h candle; live orderflow is intentionally excluded."}
             decision=_ryma_ai_decision(sym,hist,hist,None,price,{},historical_context)
             calls+=1
-            side=int(decision["side"]); lv=decision["lv"]
-            entry_i=i+1; entry=float(prepared["open"].iloc[entry_i])*(1+SLIP*side)
-            risk=abs(entry-float(lv["sl"]))
-            if risk<=0 or risk>entry*0.035: i+=stride; continue
-            # Rebase the AI stop/targets around the actual next-open fill; never use future bars for the decision.
-            shift=entry-price
-            sl=float(lv["sl"])+shift
-            tps=[float(x["px"])+shift for x in lv["tps"]]
-            risk=abs(entry-sl)
-            if risk<=0: i+=stride; continue
-            remaining=1.0; realized=0.0; hit=0; exit_kind="TIME"; exit_i=min(n-1,entry_i+18)
-            fracs=(.50,.25,.15,.10)
-            for j in range(entry_i, min(n,entry_i+19)):
-                hi=float(prepared["high"].iloc[j]); lo=float(prepared["low"].iloc[j]); op=float(prepared["open"].iloc[j]); cl=float(prepared["close"].iloc[j])
-                # Conservative collision policy: if SL and TP touch in same candle, SL wins.
-                stop_hit=(lo<=sl if side==1 else hi>=sl)
-                if stop_hit:
-                    fill=min(op,sl) if side==1 else max(op,sl)
-                    realized+=remaining*side*(fill-entry)/risk; remaining=0; exit_kind="SL"; exit_i=j; break
-                for k,tp in enumerate(tps):
-                    if k<hit: continue
-                    touched=(hi>=tp if side==1 else lo<=tp)
-                    if touched:
-                        realized+=fracs[k]*side*(tp-entry)/risk; remaining-=fracs[k]; hit+=1
-                    else: break
-                exit_i=j
-                if remaining<=1e-9: exit_kind="TP"; break
-            if remaining>0:
-                close=float(prepared["close"].iloc[exit_i])
-                realized+=remaining*side*(close-entry)/risk
-            cost=(2*FEE+SLIP)*entry/risk
-            net=realized-cost
-            trades.append(dict(coin=sym,sym=sym,t=int(prepared["t"].iloc[entry_i]),signal_t=int(prepared["t"].iloc[i]),
-              R=round(net,4),gross_R=round(realized,4),exit=exit_kind,bars=exit_i-entry_i+1,
-              tps=hit,cost=round(cost,4),grade=decision["grade"],side=side,setup="AI",entry=entry,sl=sl,tp=tps,
-              data_start=int(prepared["t"].iloc[start]),data_end=int(prepared["t"].iloc[-1])))
+            side=int(decision["side"])
+            entry_i=i+1
+            entry=float(prepared["open"].iloc[entry_i])*(1+SLIP*side)
+            atr=float(prepared["atr"].iloc[i])
+            if not np.isfinite(atr) or atr<=0: atr=price*0.01
+            risk=min(max(atr*1.50,price*0.0045),price*0.035)
+            if risk<=0 or risk>entry*0.04:
+                i+=stride; continue
+            net,gross,hit,exit_kind,exit_i,cost=_backtest_manage_trade(
+                prepared,entry_i,side,entry,risk,atr)
+            sl=entry-side*risk
+            tps=[entry+side*risk*r for r in (1.0,1.8,2.8,4.0)]
+            trades.append(dict(coin=sym,sym=sym,t=int(prepared["t"].iloc[entry_i]),
+                signal_t=int(prepared["t"].iloc[i]),R=net,gross_R=gross,exit=exit_kind,
+                bars=exit_i-entry_i+1,tps=hit,cost=round(cost,4),grade=decision["grade"],
+                side=side,setup="ATR trend exits v1",entry=entry,sl=sl,tp=tps,
+                data_start=int(prepared["t"].iloc[start]),data_end=int(prepared["t"].iloc[-1])))
         except Exception as ex:
             log.warning("AI backtest decision failed %s at %s: %s",sym,i,str(ex)[:160])
             if calls==0: raise
@@ -3751,7 +3783,7 @@ def bt_report(per,tmin,tmax,label,errors=None):
     lines = [f"📊 Backtest {label} ({len(per or {})} عملة صالحة) · {BOT_VERSION}",
              f"📥 العملات التي فشل تحميلها/اختبارها: {len(errors)}",
              "🧪 تقسيم TRAIN/TEST مستقل زمنياً لكل عملة.",
-             "⚠️ اختبار AI بعينات قرارات تاريخية متباعدة لتقليل التكلفة؛ رسوم التداول والانزلاق مقدّرة، والتمويل التاريخي غير مضمّن."]
+             "⚠️ اختبار 4H بعينات أوسع؛ إدارة الخروج تحاكي TP الجزئي ثم BE بعد TP1 وTrailing بعد TP2 وحد 6 شموع. الرسوم/الانزلاق مقدّرة والتمويل غير مضمّن."]
     if str(label).upper()=="TOP50":
         lines.append("⚠️ TOP50 مبنية على سيولة اليوم؛ ليست عينة تاريخية خالية من انحياز البقاء.")
     if not valid_range:
@@ -3766,6 +3798,35 @@ def bt_report(per,tmin,tmax,label,errors=None):
         lines += ["", f"📈 TRAIN: n={mt['n']} | WR {mt['wr']}% | PF {mt['pf']} | {mt['total']:+}R",
                   f"📊 TEST : n={me['n']} | WR {me['wr']}% | PF {me['pf']} | {me['total']:+}R",
                   f"🎯 وصول TP1: {me['tp1']}%", ""]
+        # Diagnostic breakdown is calculated on TEST only to avoid mixing in-sample results.
+        wins=[x for x in te if float(x.get("R",0))>0]
+        losses=[x for x in te if float(x.get("R",0))<=0]
+        avg_win=float(np.mean([x["R"] for x in wins])) if wins else 0.0
+        avg_loss=float(np.mean([x["R"] for x in losses])) if losses else 0.0
+        lines += ["🔎 تشخيص TEST:",
+                  f"متوسط الرابحة: {avg_win:+.2f}R | متوسط الخاسرة: {avg_loss:+.2f}R",
+                  f"BUY: {sum(1 for x in te if int(x.get('side',0))==1)} | SELL: {sum(1 for x in te if int(x.get('side',0))==-1)}"]
+        for side,label in ((1,"BUY"),(-1,"SELL")):
+            subset=[x for x in te if int(x.get("side",0))==side]
+            if subset:
+                sm=metrics(subset)
+                lines.append(f"{label}: n={sm['n']} · WR {sm['wr']}% · PF {sm['pf']} · {sm['total']:+}R")
+        for kind,label in (("SL","ضرب SL"),("BE","وقف تعادل بعد TP1"),("TRAIL","وقف متحرك بعد TP2"),("TP","إكمال الأهداف"),("TIME","خروج زمني")):
+            subset=[x for x in te if x.get("exit")==kind]
+            if subset:
+                lines.append(f"{label}: {len(subset)} صفقة · {sum(float(x.get('R',0)) for x in subset):+.1f}R")
+        bysym=[]
+        for coin in sorted({str(x.get("sym",x.get("coin","?"))) for x in te}):
+            subset=[x for x in te if str(x.get("sym",x.get("coin","?")))==coin]
+            cm=metrics(subset)
+            bysym.append((coin,cm))
+        worst=sorted(bysym,key=lambda z:z[1]["total"])
+        best=sorted(bysym,key=lambda z:z[1]["total"],reverse=True)
+        if worst:
+            lines.append("أسوأ العملات: "+" | ".join(f"{c} {m['total']:+.1f}R (n={m['n']})" for c,m in worst[:5]))
+        if best:
+            lines.append("أفضل العملات: "+" | ".join(f"{c} {m['total']:+.1f}R (n={m['n']})" for c,m in best[:5]))
+        lines.append("")
         if me["n"] < 30:
             verdict = "⚪ عينة الاختبار صغيرة — لا يعتمد عليها للحكم"
         else:
