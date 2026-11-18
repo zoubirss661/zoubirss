@@ -612,7 +612,7 @@ RYMA_AI_CACHE_TTL = max(60, _int("RYMA_AI_CACHE_TTL", 300))
 RYMA_CVD_TRADES = max(100, min(1000, _int("RYMA_CVD_TRADES", 500)))
 MAINTENANCE = _e("MAINTENANCE", "0") == "1"
 BRAND = "💎 Ryma Crypto 💎"
-BOT_VERSION = "Ryma Crypto AI Signal v7.0-rc2 · 2026-11-18"
+BOT_VERSION = "Ryma Crypto AI Signal v7.1-REBUILT-RC1 · 2026-11-18"
 # PRINCIPLE: alerts & analysis only — never places exchange orders
 CYCLE_RADAR = 300
 WHALE_MIN_USD = 500000
@@ -934,16 +934,6 @@ def get_golden_config():
         if not cfg or not isinstance(cfg,dict):
             cfg=dict(DEFAULT_GOLDEN_CONFIG); store.data["settings"]["golden_config"]=cfg; store.save("settings")
         merged=dict(DEFAULT_GOLDEN_CONFIG); merged.update(cfg)
-        # فرض التخفيف: لا نترك قيم قديمة من Gist تشدّ الشروط
-        merged["require_rsi"] = False
-        merged["require_1d_trend"] = False
-        merged["require_mtf"] = False
-        merged["require_volume"] = False
-        merged["require_breakout"] = False
-        merged["require_liquidity"] = False
-        merged["require_alpha"] = False
-        if merged.get("min_score", 0) > 1:
-            merged["min_score"] = 0
         return merged
 def set_golden_config(key,value):
     with store.lock:
@@ -2594,54 +2584,61 @@ def _ryma_ai_decision(sym, df, df_1h, df_15m, price, deriv, ai_context):
                 strategy=("Adaptive Trend Rider" if aligned else "Liquidity/Flow fallback"))
 
 def analyze(sym):
+    """Live analysis: use the same engineering decision/levels engine as backtests.
+
+    If the strict engine has no qualified setup, preserve the product's requested
+    always-report behavior as a clearly labelled grade-C fallback (never a fake
+    probability). The fallback still has a hard 3% stop cap and four ordered R targets.
+    """
     tf = default_tf(sym)
-    df = get_candles(sym, tf, 450)
-    degraded = bool(df.attrs.get("degraded"))
-    df = add_indicators(df, 100)
+    df_raw = get_candles(sym, tf, 450)
+    degraded = bool(df_raw.attrs.get("degraded"))
+    source = df_raw.attrs.get("source", "binance_fut")
+    df = add_indicators(df_raw, 100)
+    if len(df) < 220:
+        raise NoData(f"{sym}: شموع غير كافية للتحليل")
     i = len(df) - 1
-    price, _ = live_price(sym)
-    price = float(price or df["close"].iloc[-1])
+
+    # Use the last CLOSED candle as the decision/entry reference. This avoids
+    # mixing a live ticker with a different candle source and keeps live signal
+    # construction aligned with the close-based historical engine.
+    price = float(df["close"].iloc[-1])
     if not np.isfinite(price) or price <= 0:
         raise NoData(sym)
 
-    # Pull the same public market feeds for every symbol; missing optional feeds
-    # become warnings, not fabricated values.
     df_d = None
     try:
-        df_d = add_indicators(get_candles(sym, "1d", 250, ttl=300, min_bars=100), 100)
+        df_d = get_candles(sym, "1d", 260, ttl=300, min_bars=100)
     except Exception as _ex:
         log.debug("daily context unavailable for %s: %s", sym, _ex)
-    df_1h = df if tf == "1h" else None
-    if df_1h is None:
-        try: df_1h = add_indicators(get_candles(sym, "1h", 250, ttl=180, min_bars=80), 80)
-        except Exception: df_1h = None
+    df_1h = None
+    if tf == "1h":
+        df_1h = df_raw
+    else:
+        try:
+            df_1h = get_candles(sym, "1h", 260, ttl=180, min_bars=100)
+        except Exception as _ex:
+            log.debug("1h context unavailable for %s: %s", sym, _ex)
     df_15m = None
-    try: df_15m = get_candles(sym, "15m", 220, ttl=120, min_bars=80)
-    except Exception: df_15m = None
+    try:
+        df_15m = get_candles(sym, "15m", 220, ttl=120, min_bars=80)
+    except Exception as _ex:
+        log.debug("15m context unavailable for %s: %s", sym, _ex)
+
+    # Existing visual/context indicators are retained; engine indicators are
+    # independently prepared from the same raw OHLCV candles as the backtester.
+    eng_df = eng_prepare(df_raw)
+    # Same daily aggregation as eng_simulate/backtest; auxiliary 1h/15m and
+    # derivatives remain contextual and do not silently alter the tested rules.
+    daily_raw_for_engine = eng_resample_daily(df_raw)
+    eng_daily = eng_prepare(daily_raw_for_engine) if not daily_raw_for_engine.empty else None
+    if eng_df.empty or len(eng_df) < 220:
+        raise NoData(f"{sym}: تعذر تجهيز مؤشرات المحرك الهندسي")
 
     deriv = derivatives_snapshot(sym)
     ai_context = adaptive_ai_context(sym, df_1h, df_15m, deriv)
-    decision = _ryma_ai_decision(sym, df, df_1h, df_15m, price, deriv, ai_context)
-    side, grade = decision["side"], decision["grade"]
-    atr_now = float(decision["atr"])
-    # ATR-based targets are transparent and directionally valid. C setups receive
-    # wider caution messaging; no made-up model probability is shown.
-    risk_pct = 0.018 if decision["regime"].get("code") == "high_vol" else 0.012
-    risk = max(atr_now * (2.0 if grade == "C" else 1.6), price * risk_pct)
-    risk = min(risk, price * 0.08)
-    lv = _hypo_levels(price, side, max(risk / 1.5, price * 0.002))
-    lv["risk"] = float(risk)
-    lv["sl"] = float(price - side * risk)
-    lv["entry"] = float(price)
-    for j, tp in enumerate(lv["tps"]):
-        mult = (1.2, 2.0, 3.0, 4.0)[j]
-        tp["px"] = float(price + side * risk * mult)
-        if side < 0: tp["px"] = max(tp["px"], price * 0.05)
-        tp["pct"] = round(100 * side * (tp["px"] - price) / price, 3)
-    lv["atr"] = atr_now
-
     trend = detect_trend(df, i)
-    bias_d = daily_bias(df_d) if df_d is not None else 0
+    bias_d = daily_bias(add_indicators(df_d, 100)) if df_d is not None else 0
     candle = detect_candle_pattern(df, i)
     sr_high, sr_low = find_sr_levels(df)
     fibs = fib_levels(df)
@@ -2653,28 +2650,123 @@ def analyze(sym):
             for pat in detect_all_patterns(p_df, pat_tf):
                 if pat["name"] not in seen_names:
                     seen_names.add(pat["name"]); patterns.append(pat)
-        except Exception:
+        except Exception as _ex:
+            log.debug("pattern context %s %s: %s", sym, pat_tf, _ex)
+
+    # One canonical live decision path: eng_evaluate == eng_simulate decision path.
+    side_hint = eng_trend_state(eng_df, len(eng_df)-1)
+    fut = futures_score_for(sym, side_hint if side_hint in (-1, 1) else 1)
+    oi = deriv.get("oi") if isinstance(deriv, dict) else None
+    oi_change = oi.get("change_pct") if isinstance(oi, dict) else None
+    funding = deriv.get("funding") if isinstance(deriv, dict) else None
+    ls_ratio = deriv.get("ls_ratio") if isinstance(deriv, dict) else None
+    if isinstance(ls_ratio, dict):
+        ls_ratio = ls_ratio.get("ratio") or ls_ratio.get("long_short_ratio")
+    eng_result = eng_evaluate(
+        eng_df, htf=eng_daily, price=price, cfg=ENG_CFG)
+
+    if eng_result.get("status") in ("LONG", "SHORT") and eng_result.get("lv"):
+        side = int(eng_result["side"])
+        grade = eng_result["grade"]
+        lv = eng_result["lv"]
+        reasons = list(eng_result.get("reasons") or [])
+        warnings = list(eng_result.get("warnings") or [])
+        score = float(eng_result.get("score", 0.0))
+        factors = dict(eng_result.get("factor_scores") or {})
+        forced = False
+        strategy = "Ryma Engineering Confluence"
+        confidence = eng_result.get("confidence")
+        confidence_type = eng_result.get("confidence_type", "confluence_index")
+    else:
+        # Explicit C-grade fallback: direction from the legacy adaptive context,
+        # but no 8% stop and no independent legacy target generator.
+        legacy = _ryma_ai_decision(sym, df, df_1h, df_15m, price, deriv, ai_context)
+        side = int(legacy.get("side", 0))
+        if side not in (-1, 1):
+            side = side_hint if side_hint in (-1, 1) else (1 if bias_d >= 0 else -1)
+        atr_now = float(eng_df["atr"].iloc[-1])
+        if not np.isfinite(atr_now) or atr_now <= 0:
+            atr_now = price * 0.01
+        lv, why_not = eng_build_levels(eng_df, len(eng_df)-1, side, price, atr_now,
+                                       eng_daily, len(eng_daily)-1 if eng_daily is not None and not eng_daily.empty else None,
+                                       ENG_CFG)
+        if lv is None:
+            # Conservative, transparent emergency levels; risk is capped at 3%.
+            risk = min(max(1.2 * atr_now, price * 0.008), price * 0.03)
+            sl = price - side * risk
+            targets = []
+            for mult, frac in zip((1.5, 2.5, 3.5, 5.0), ENG_TP_FRACS):
+                px = price + side * risk * mult
+                if side == -1:
+                    px = max(px, price * 0.05)
+                targets.append(dict(px=float(px), pct=round(100*side*(px-price)/price, 3),
+                                    frac=frac, hit=False, src="fallback_R"))
+            lv = dict(entry=float(price), sl=float(sl), risk=float(risk), tps=targets, atr=float(atr_now))
+        reasons = list(legacy.get("reasons") or [])
+        warnings = list(legacy.get("warnings") or [])
+        warnings.insert(0, "⚠️ إعداد احتياطي C: لم يجتز شروط المحرك الصارم؛ لا تعتبره إشارة عالية الجودة.")
+        if eng_result.get("wait_reasons"):
+            warnings.append("سبب عدم اجتياز المحرك: " + "؛ ".join(eng_result["wait_reasons"][:2]))
+        if degraded:
+            warnings.append("مصدر الشموع Spot بديل؛ الدخول محسوب من إغلاق المصدر نفسه وقد يختلف عن Futures.")
+        grade, score, factors = "C", float(legacy.get("score", 0.0)), dict(legacy.get("factors") or {})
+        forced, strategy = True, "Adaptive C Fallback"
+        confidence, confidence_type = None, "unavailable_not_calibrated"
+
+    # Safety invariants applied to every live setup, including fallback.
+    lv["entry"] = float(price)
+    lv["risk"] = abs(float(price) - float(lv["sl"]))
+    max_risk = price * float(ENG_CFG.get("max_risk_pct", 0.03))
+    if lv["risk"] > max_risk:
+        lv["sl"] = float(price - side * max_risk)
+        lv["risk"] = max_risk
+    if lv["risk"] <= 0 or not np.isfinite(lv["risk"]):
+        raise NoData(f"{sym}: وقف الخسارة غير صالح")
+    tps = sorted((dict(x) for x in lv.get("tps", [])),
+                 key=lambda x: side * (float(x["px"])-price))
+    clean_tps = []
+    last_dist = 0.0
+    for j, tp in enumerate(tps[:4]):
+        px = float(tp["px"])
+        dist = side * (px-price)
+        if not np.isfinite(px) or dist <= last_dist:
             continue
+        if side == -1 and px <= 0:
+            continue
+        tp.update(px=px, pct=round(100*side*(px-price)/price, 3),
+                  frac=ENG_TP_FRACS[len(clean_tps)], hit=False)
+        clean_tps.append(tp); last_dist = dist
+    while len(clean_tps) < 4:
+        mult = (1.5, 2.5, 3.5, 5.0)[len(clean_tps)]
+        px = price + side * lv["risk"] * mult
+        if side == -1: px = max(px, price * 0.05)
+        clean_tps.append(dict(px=float(px), pct=round(100*side*(px-price)/price, 3),
+                              frac=ENG_TP_FRACS[len(clean_tps)], hit=False, src="R"))
+    lv["tps"] = clean_tps
+    lv["atr"] = float(eng_df["atr"].iloc[-1])
+
     if degraded:
-        decision["warnings"].append("بيانات الشموع من مصدر Spot بديل؛ الأسعار قد تختلف عن العقود الآجلة")
-    fut = futures_score_for(sym, side)
+        warnings.append("مصدر الشموع Spot بديل؛ الأسعار قد تختلف عن عقود Futures.")
+    if not isinstance(deriv, dict): deriv = {}
+    fut_details = fut.get("details", []) if isinstance(fut, dict) else []
     return dict(
-        sym=sym, tf=tf, df=df, side=side, strategy=decision["strategy"],
+        sym=sym, tf=tf, df=df, side=side, strategy=strategy,
         rank={"A+":3,"A":2,"B":1,"C":0}.get(grade,0), grade=grade,
-        setup=decision["strategy"], ok=1 if grade in ("A+","A","B") else 0, total=4,
-        wait=False, forced=decision["forced"], wait_reasons=decision["wait_reasons"],
-        reasons=decision["reasons"], warnings=decision["warnings"],
-        score=decision["score"], confidence=None,
-        confidence_type=decision["confidence_type"], watch=None,
-        trends={"1h":decision["regime"].get("name","غير حاسم")},
-        lv=lv, price=price, degraded=degraded, source=df.attrs.get("source","binance_fut"),
+        setup=strategy, ok=1 if grade in ("A+","A","B") else 0, total=4,
+        wait=False, forced=forced, wait_reasons=list(warnings),
+        reasons=reasons, warnings=list(dict.fromkeys(warnings)),
+        score=score, confidence=confidence, confidence_type=confidence_type,
+        watch=None, trends={"1d":(eng_result.get("trends") or {}).get("d1",0),
+                            "4h":(eng_result.get("trends") or {}).get("h4",0),
+                            "1h":(eng_result.get("trends") or {}).get("h1",0)},
+        lv=lv, price=price, degraded=degraded, source=source,
         bar_t=int(df.iloc[-1]["t"]), rsi=float(df.iloc[-1]["rsi"]) if pd.notna(df.iloc[-1]["rsi"]) else 50.0,
         macd=float(df.iloc[-1]["macd"]) if pd.notna(df.iloc[-1]["macd"]) else 0.0,
         candle=candle, trend=trend,
         trend_d=("down" if bias_d==-1 else ("up" if bias_d==1 else "range")),
         sr_high=sr_high[:3], sr_low=sr_low[:3], fibs=fibs,
-        fut_score=fut.get("score",0), fut_details=fut.get("details",[]),
-        patterns=patterns, factor_scores=decision["factors"],
+        fut_score=fut.get("score",0) if isinstance(fut,dict) else 0,
+        fut_details=fut_details, patterns=patterns, factor_scores=factors,
         derivatives_status=deriv.get("source_status",{}), ai_context=ai_context)
 
 def get_analysis(sym,force=False):
@@ -2752,22 +2844,32 @@ def smart_cleanup_trades():
     now_ms=int(time.time()*1000); act=active_signals()
     fill_ratio=len(act)/MAX_OPEN if MAX_OPEN>0 else 0
     closed_profit=closed_age=closed_forced=0
+    archived=[]
     with store.lock:
         for p in list(store.data["signals"]):
             if p.get("state") not in ("pending","open"): continue
             age_days=(now_ms-p.get("created",now_ms))/(DAY*1000)
-            cur_r=p.get("realized",0.0)
+            cur_r=float(p.get("realized",0.0) or 0.0)
+            fill=float(p.get("fill") or p.get("entry") or 0.0)
+            risk=float(p.get("risk") or 0.0)
+            net_r=cur_r-(2*(FEE+SLIP)*fill/risk if fill>0 and risk>0 else 0.0)
+            reason=None
             if age_days>SMART_MAX_AGE_DAYS:
-                p["state"]="closed"; p["result"]="AGE_CLOSE"
-                p["R"]=p.get("R") or round(cur_r,3); p["closed"]=now_ms; closed_age+=1; continue
-            if age_days>SMART_PROFIT_DAYS and cur_r>2.0:
-                p["state"]="closed"; p["result"]="PROFIT_TAKE"
-                p["R"]=round(cur_r,3); p["closed"]=now_ms; closed_profit+=1; continue
-            if fill_ratio>SMART_FILL_TRIGGER and age_days>SMART_FORCE_DAYS and cur_r<0:
-                p["state"]="closed"; p["result"]="SMART_EXIT"
-                p["R"]=round(cur_r,3); p["closed"]=now_ms; closed_forced+=1; continue
-        if closed_profit+closed_age+closed_forced: store.save("signals")
-    return closed_profit+closed_age+closed_forced
+                reason="AGE_CLOSE"; closed_age+=1
+            elif age_days>SMART_PROFIT_DAYS and cur_r>2.0:
+                reason="PROFIT_TAKE"; closed_profit+=1
+            elif fill_ratio>SMART_FILL_TRIGGER and age_days>SMART_FORCE_DAYS and cur_r<0:
+                reason="SMART_EXIT"; closed_forced+=1
+            if reason:
+                p["state"]="closed"; p["result"]=reason
+                p["R"]=round(net_r,3); p["closed"]=now_ms
+                archived.append(dict(p))
+        if archived: store.save("signals")
+    # Route every forced close through the same archive path as normal SL/TP exits.
+    for p in archived:
+        try: _archive(p)
+        except Exception as ex: log.warning("cleanup archive failed %s: %s",p.get("id"),ex)
+    return len(archived)
 
 def check_signals_sync():
     notes=[]; by={}
@@ -4107,7 +4209,7 @@ async def run_autopost(bot):
             if mtf_t>=2 and mtf_c<mtf_t: continue
         try: sent=await publish(bot,r,vip=True,free=False,admin_copy=False)
         except Exception: continue
-        if any(x in ("VIP","FREE") for x in sent):
+        if any(x.startswith("VIP_") for x in sent):
             _mark_posted(r); vip_n+=1; used.add(r["sym"]); await asyncio.sleep(1.0)
     if vip_n==0:
         # Keep C as a genuine fallback for VIP: never silently drop it due to grade.
@@ -5525,10 +5627,10 @@ async def cmd_post(update,ctx):
     if not ctx.args: await update.message.reply_text("مثال: /post BTC"); return
     sym=clean_symbol(ctx.args[0])
     res=await asyncio.to_thread(get_analysis,sym,True)
-    if res.get("grade") in ("C","WAIT") or res.get("wait"):
+    if res.get("grade") == "WAIT" or res.get("wait"):
         await update.message.reply_text(f"⛔ {sym}: لا توجد صفقة مؤهلة (انتظار) — لا تُنشر للقنوات."); return
     sent=await publish(ctx.bot,res,vip=True,free=True,admin_copy=False)
-    if any(x in ("VIP","FREE") for x in sent) and res["rank"]>=0: track_signal(res)
+    if any(x.startswith(("VIP_", "FREE_")) for x in sent) and res["rank"]>=0: track_signal(res)
     await update.message.reply_text(f"✅ نُشر: {', '.join(sent)}")
 
 @admin_only
@@ -6894,7 +6996,7 @@ async def post_init(app):
         asyncio.create_task(morning_brief_loop(app)),
         asyncio.create_task(shadow_loop(app))]
     log.info("version %s",BOT_VERSION)
-    log.info("ryma v5.0-rc1 (multi-factor engine+always-trade) | max_open=%d | golden=%ds | min_score=%.1f | multi=%s | points=%d→VIP%d | patterns=MTF | bilingual=auto | whale_min=$500000 | SL≤3%% hard | RR≥1.5 | min_score=8.5 | MTF strict | hype=admin | neon=admin | patterns_chart=admin",
+    log.info("Ryma v7.1 rebuilt: unified live/backtest engine | max_open=%d | golden=%ds | min_score=%.1f | multi=%s | points=%d→VIP%d | patterns=MTF | bilingual=auto | whale_min=$500000 | SL≤3%% hard",
              MAX_OPEN,CYCLE_GOLDEN,get_golden_config().get("min_score",1),is_multi_exchange(),
              VIP_THRESHOLD,VIP_REWARD_DAYS)
 
