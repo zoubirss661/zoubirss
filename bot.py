@@ -1872,9 +1872,13 @@ def _ryma_ai_decision(sym, df, df_1h, df_15m, price, deriv, ai_context):
           "strategy":"Ryma Remote AI Decision","confidence":None,"confidence_type":"not_calibrated",
           "setup":str(answer.get("setup","AI Market Read"))[:100],"invalidation":str(answer.get("invalidation",""))[:240]}
     else:
-        # Keep /bt as a frozen 4H v9.3 reference until the full MTF archive is supplied.
-        # Live analysis uses v10; the old backtest path must never be mislabeled as v10.
-        if (ai_context or {}).get("backtest_mode"):
+        mode=(ai_context or {}).get("backtest_mode")
+        if mode == "v10_mtf":
+            # Historical replay supplies strictly closed 4H/1H/15M frames.
+            # Never route this mode through the legacy 4H local-ML reference.
+            result=_ryma_v10_hybrid_decision(sym,df_1h,df_15m,float(price),ai_context)
+            return result  # bypass live cache: every historical timestamp is unique context
+        if mode:
             result=_ryma_local_ml_decision(sym,base,float(price),ai_context)
         else:
             result=_ryma_v10_hybrid_decision(sym,df_1h,df_15m,float(price),ai_context)
@@ -3827,6 +3831,174 @@ def backtest_symbol(sym, years=3.0):
     for tr in trades: tr["data_source"]=source
     return trades,int(prepared["t"].iloc[start]),int(prepared["t"].iloc[-1])
 
+def _backtest_manage_trade_v10(prepared15, entry_i, side, entry, risk, atr_at_signal, max_bars=96):
+    """V10 partial exits on 15m bars; conservative stop-first handling on collisions."""
+    sl=float(entry)-int(side)*float(risk)
+    tps=[float(entry)+int(side)*float(risk)*r for r in (1.0,1.7,2.6,3.8)]
+    fracs=(0.35,0.30,0.20,0.15)
+    remaining=1.0; realized=0.0; hit=0; be=False; trail_on=False
+    ext=float(entry); exit_kind="TIME"; end=min(len(prepared15),entry_i+max_bars)
+    exit_i=min(len(prepared15)-1,end-1)
+    for j in range(entry_i,end):
+        hi=float(prepared15["high"].iloc[j]); lo=float(prepared15["low"].iloc[j])
+        op=float(prepared15["open"].iloc[j]); cl=float(prepared15["close"].iloc[j])
+        stop_hit=(lo<=sl if side==1 else hi>=sl)
+        if stop_hit:
+            fill=min(op,sl) if side==1 else max(op,sl)
+            realized+=remaining*side*(fill-entry)/risk
+            exit_kind="TRAIL" if trail_on else ("BE" if be else "SL")
+            exit_i=j; remaining=0.0; break
+        for k,tp in enumerate(tps):
+            if k<hit: continue
+            touched=(hi>=tp if side==1 else lo<=tp)
+            if touched:
+                realized+=fracs[k]*side*(tp-entry)/risk
+                remaining-=fracs[k]; hit+=1
+            else:
+                break
+        exit_i=j
+        if remaining<=1e-9:
+            exit_kind="TP"; remaining=0.0; break
+        if hit>=1 and not be:
+            be_sl=entry+side*0.05*risk
+            sl=max(sl,be_sl) if side==1 else min(sl,be_sl)
+            be=True
+        ext=max(ext,hi) if side==1 else min(ext,lo)
+        if hit>=2:
+            trail_on=True
+            atr=float(prepared15["atr"].iloc[j]) if "atr" in prepared15.columns else float(atr_at_signal)
+            if np.isfinite(atr) and atr>0:
+                candidate=ext-side*2.0*atr
+                sl=max(sl,candidate) if side==1 else min(sl,candidate)
+        if j==end-1 and remaining>0:
+            realized+=remaining*side*(cl-entry)/risk
+            remaining=0.0; exit_kind="TIME"; exit_i=j
+    if remaining>0:
+        cl=float(prepared15["close"].iloc[exit_i])
+        realized+=remaining*side*(cl-entry)/risk
+    # Entry is slipped in the simulated fill; charge both-side taker fees and exit slippage.
+    cost=(2*FEE+SLIP)*entry/risk
+    return round(realized-cost,4),round(realized,4),hit,exit_kind,exit_i,cost
+
+
+def backtest_v10_symbol(sym, years=1.0):
+    """True v10 MTF replay: 4H regime + 1H confirmation + closed 15M trigger/execution."""
+    years=float(years); years=min(max(years,0.1),3.0)
+    bars={"15m":int(years*365*96)+300,
+          "1h":int(years*365*24)+300,
+          "4h":int(years*365*6)+300}
+    frames={}
+    for tf in ("4h","1h","15m"):
+        rows=binance_futures_klines_long(sym,tf,bars[tf])
+        if not rows: raise NoData(f"{sym}: لا توجد بيانات {tf} تاريخية من Binance Futures")
+        raw=_rows_to_df(rows,tf,bars[tf])
+        minimum={"4h":210,"1h":205,"15m":60}[tf]
+        if len(raw)<minimum: raise NoData(f"{sym}: بيانات {tf} غير كافية ({len(raw)}/{minimum})")
+        frames[tf]=add_indicators(raw,100)
+    d4,h1,m15=frames["4h"],frames["1h"],frames["15m"]
+    t4=d4["t"].to_numpy(dtype="int64"); t1=h1["t"].to_numpy(dtype="int64"); t15=m15["t"].to_numpy(dtype="int64")
+    start=204; n=len(h1)
+    stride=max(1,int(np.ceil((n-start)/RYMA_AI_BACKTEST_MAX_CALLS)))
+    trades=[]; i=start; calls=0; next_allowed_ms=0
+    while i<n-1 and calls<RYMA_AI_BACKTEST_MAX_CALLS:
+        signal_close=int(t1[i])+TF_MS["1h"]
+        if signal_close<next_allowed_ms:
+            i+=stride; continue
+        # Only candles whose close time is <= signal_close are visible to the decision.
+        e4=int(np.searchsorted(t4,signal_close-TF_MS["4h"],side="right"))
+        e15=int(np.searchsorted(t15,signal_close-TF_MS["15m"],side="right"))
+        hist1=h1.iloc[:i+1]
+        hist4=d4.iloc[:e4]
+        hist15=m15.iloc[:e15]
+        if len(hist4)<210 or len(hist15)<60:
+            i+=stride; continue
+        price=float(hist1["close"].iloc[-1])
+        try:
+            context={"backtest_mode":"v10_mtf","timeframe":"1h",
+                     "timeframe_stack":["4h","1h","15m"],"_df_4h":hist4,
+                     "historical_asof_ms":signal_close}
+            decision=_ryma_ai_decision(sym,hist1,hist1,hist15,price,{},context)
+            calls+=1
+            side=int(decision["side"])
+            # Enter at the first 15m open at/after the completed 1h signal candle.
+            entry_i=int(np.searchsorted(t15,signal_close,side="left"))
+            if entry_i>=len(m15): break
+            atr=float(hist15["atr"].iloc[-1])
+            if not np.isfinite(atr) or atr<=0: atr=price*0.004
+            risk=min(max(atr*1.6,price*0.0035),price*0.025)
+            if risk<=0: i+=stride; continue
+            entry=float(m15["open"].iloc[entry_i])*(1+SLIP*side)
+            risk=min(max(atr*1.6,entry*0.0035),entry*0.025)
+            net,gross,hit,exit_kind,exit_i,cost=_backtest_manage_trade_v10(
+                m15,entry_i,side,entry,risk,atr,96)
+            sl=entry-side*risk
+            tps=[entry+side*risk*r for r in (1.0,1.7,2.6,3.8)]
+            trades.append(dict(coin=sym,sym=sym,t=int(t15[entry_i]),signal_t=signal_close,
+                R=net,gross_R=gross,exit=exit_kind,bars=exit_i-entry_i+1,tps=hit,
+                cost=round(cost,4),grade=decision["grade"],score=decision.get("score",0),
+                side=side,setup=decision.get("setup","V10 MTF"),strategy="Ryma v10 Adaptive Hybrid",
+                entry=entry,sl=sl,tp=tps,data_start=int(t1[start]),data_end=int(t1[-1]),
+                signal_tf="1h",trigger_tf="15m",regime_tf="4h",data_source="binance_futures_api"))
+            next_allowed_ms=int(t15[exit_i])+TF_MS["15m"]
+        except Exception as ex:
+            log.warning("V10 MTF backtest failed %s at %s: %s",sym,i,str(ex)[:160])
+            if calls==0: raise
+        i+=stride
+    if calls==0: raise RuntimeError(f"{sym}: لم ينتج محرك v10 أي قرار صالح؛ راجع توافر بيانات الأطر الثلاثة")
+    return trades,int(t1[start]),int(t1[-1])
+
+
+def backtest_v10_many(symbols, years=1.0, max_workers=1):
+    per,tmin,tmax,errors={},None,None,{}
+    symbols=list(dict.fromkeys(s.strip().upper() for s in (symbols or []) if isinstance(s,str) and s.strip()))
+    def _one(sym):
+        try:
+            trs,a,b=backtest_v10_symbol(sym,years)
+            return sym,(trs,a,b),None
+        except Exception as ex:
+            log.exception("backtest_v10_symbol failed for %s",sym)
+            return sym,None,f"{type(ex).__name__}: {ex}"
+    workers=max(1,min(int(max_workers or 1),2,len(symbols))) if symbols else 1
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for sym,result,error in pool.map(_one,symbols):
+            if error: errors[sym]=error; continue
+            trs,a,b=result; per[sym]=trs
+            tmin=a if tmin is None else min(tmin,a); tmax=b if tmax is None else max(tmax,b)
+    return per,tmin,tmax,errors
+
+
+def bt_v10_report(per,tmin,tmax,label,errors=None):
+    errors=errors or {}
+    alltr=[x for group in (per or {}).values() for x in group if isinstance(x,dict) and isinstance(x.get("R"),(int,float))]
+    lines=[f"📊 Backtest V10 MTF {label} ({len(per or {})} عملة صالحة) · {BOT_VERSION}",
+      f"📥 العملات التي فشل تحميلها/اختبارها: {len(errors)}",
+      "🧠 المحرك المختبَر فعلياً: v10 Adaptive Hybrid | 4H regime + 1H confirmation + 15M trigger",
+      "🕯️ القرار عند إغلاق 1H؛ الدخول عند افتتاح أول شمعة 15M التالية؛ التنفيذ والخروج على 15M.",
+      "⚠️ الرسوم والانزلاق مقدّرة؛ التمويل التاريخي غير مضمّن بعد. لا تعتمد الربحية قبل إضافته والتحقق من البيانات."]
+    if not alltr:
+        lines += ["", "لا توجد صفقات كافية للحكم."]
+    else:
+        tr,te=split_trades_by_symbol(alltr,tmin,tmax,0.65)
+        mt,me=metrics(tr),metrics(te)
+        lines += ["",f"📈 TRAIN: n={mt['n']} | WR {mt['wr']}% | PF {mt['pf']} | {mt['total']:+}R",
+                  f"📊 TEST : n={me['n']} | WR {me['wr']}% | PF {me['pf']} | {me['total']:+}R",
+                  f"🎯 وصول TP1 في TEST: {me['tp1']}%",
+                  f"📉 أقصى تراجع TEST: {me['dd']}R",""]
+        for side,label2 in ((1,"BUY"),(-1,"SELL")):
+            subset=[x for x in te if int(x.get("side",0))==side]
+            if subset:
+                sm=metrics(subset); lines.append(f"{label2}: n={sm['n']} | WR {sm['wr']}% | PF {sm['pf']} | {sm['total']:+}R")
+        for kind,label2 in (("SL","SL"),("BE","BE بعد TP1"),("TRAIL","Trailing بعد TP2"),("TP","إكمال الأهداف"),("TIME","خروج زمني")):
+            subset=[x for x in te if x.get("exit")==kind]
+            if subset: lines.append(f"{label2}: {len(subset)} صفقة | {sum(float(x.get('R',0)) for x in subset):+.1f}R")
+        lines.append("")
+        verdict="⚪ عينة صغيرة — لا حكم" if me["n"]<30 else ("🔴 ضعيف" if me["pf"]<1.1 else ("🟡 مقبول" if me["pf"]<1.5 else ("✅ جيد" if me["pf"]<1.8 else "🏆 ممتاز")))
+        lines.append(f"الحكم الأولي: {verdict}")
+    if errors:
+        lines += ["","أمثلة أخطاء:"]+[f"• {k}: {v[:130]}" for k,v in list(errors.items())[:5]]
+    return "\n".join(lines),""
+
+
 def metrics(trs):
     if not trs: return dict(n=0,wr=0.0,pf=0.0,total=0.0,avg=0.0,dd=0.0,tp1=0.0)
     srt=sorted(trs,key=lambda z:z["t"]); R=np.array([x["R"] for x in srt],dtype=float)
@@ -4790,6 +4962,26 @@ async def cmd_bt(update,ctx):
     text,_=bt_report(per,a,b,arg,errors)
     await wait.edit_text(text[:4000],link_preview_options=NO_PREVIEW)
 
+@admin_only
+async def cmd_btv10(update,ctx):
+    """Dedicated V10 MTF historical test; /bt remains the frozen legacy reference."""
+    arg=ctx.args[0].upper() if ctx.args else "ALL"
+    try: years=float(ctx.args[1]) if len(ctx.args)>1 else 1.0
+    except ValueError: years=1.0
+    years=min(max(years,0.1),3.0)
+    syms=COINS if arg in ("ALL","") else [clean_symbol(arg)]
+    syms=[x for x in (syms or []) if x]
+    if _BT_BUSY[0]:
+        await update.message.reply_text("⏳ يوجد اختبار آخر قيد التشغيل؛ انتظر حتى ينتهي."); return
+    _BT_BUSY[0]=True
+    try:
+        wait=await update.message.reply_text(f"⏳ أختبر v10 MTF فعلياً على {len(syms)} عملة · {years:g} سنة\n4H + 1H + 15M — قد يستغرق تحميل البيانات وقتاً.")
+        per,a,b,errors=await asyncio.to_thread(backtest_v10_many,syms,years,1)
+        report,_=bt_v10_report(per,a,b,arg,errors)
+        await wait.edit_text(report[:4000],link_preview_options=NO_PREVIEW)
+    finally:
+        _BT_BUSY[0]=False
+
 # ======================= AI walk-forward backtest (/btdiag) =======================
 _BT_BUSY=[False]
 
@@ -5205,7 +5397,7 @@ ADMIN_CMD_MAP={
     "/cross":cmd_cross,"/predict":cmd_predict,"/whales":cmd_whales,
     "/explosions":cmd_explosions,"/pump":cmd_pump,"/bottom":cmd_bottoms,
     "/shortsradar":cmd_shorts_radar,"/alpha":cmd_alpha,"/scan":cmd_scan,
-    "/short":cmd_short,"/bt":cmd_bt,"/bt50":cmd_bt50,"/users":cmd_users,
+    "/short":cmd_short,"/bt":cmd_bt,"/btv10":cmd_btv10,"/bt50":cmd_bt50,"/users":cmd_users,
     "/viplist":cmd_viplist,"/stats":cmd_stats,"/history":cmd_history,
     "/dashboard":cmd_dashboard,"/testchannels":cmd_testchannels,"/delist":cmd_delist,
     "/golden":cmd_golden,"/share":cmd_share,
@@ -5967,7 +6159,7 @@ def main():
         ("menu",cmd_menu),("daily",cmd_daily),("cross",cmd_cross),("predict",cmd_predict),
         ("forcepost",cmd_forcepost),("clearsignals",cmd_clearsignals),
         ("smartcleanup",cmd_smartcleanup),("debug",cmd_debug),("health",cmd_health),("regime",cmd_regime),("smartmoney",cmd_smartmoney),("active",cmd_active),
-        ("post",cmd_post),("bt",cmd_bt),("backtest",cmd_bt),("bt50",cmd_bt50),
+        ("post",cmd_post),("bt",cmd_bt),("backtest",cmd_bt),("btv10",cmd_btv10),("bt50",cmd_bt50),
         ("scan",cmd_scan),("short",cmd_short),("delist",cmd_delist),("price",cmd_price),
         ("users",cmd_users),("testchannels",cmd_testchannels),("stats",cmd_stats),
         ("history",cmd_history),("dashboard",cmd_dashboard),
