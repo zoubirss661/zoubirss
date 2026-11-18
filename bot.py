@@ -3693,22 +3693,126 @@ def predictive_scan(symbols):
     return out[:PREDICT_TOP_N]
 
 def binance_futures_klines_long(sym, tf, bars):
+    """Long Binance USD-M history. Returns normalized OHLCV rows or None."""
     interval = BINANCE_INTERVAL_MAP.get(tf)
     if not interval: return None
     out, end = [], None
     try:
         while len(out) < bars:
             params = {"symbol": f"{sym}USDT", "interval": interval, "limit": 1500}
-            if end: params["endTime"] = end
-            r = requests.get(f"{BINANCE_FAPI_BASE}/fapi/v1/klines", params=params, timeout=10)
-            if r.status_code != 200: break
+            if end is not None: params["endTime"] = end
+            r = requests.get(f"{BINANCE_FAPI_BASE}/fapi/v1/klines", params=params, timeout=15)
+            if r.status_code != 200:
+                log.warning("V10 history Binance %s %s HTTP %s: %s", sym, tf, r.status_code, r.text[:180])
+                break
             data = r.json()
             if not isinstance(data, list) or not data: break
-            out = [[int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])] for k in data] + out
-            end = int(data[0][0]) - 1
+            page = [[int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])] for k in data]
+            out = page + out
+            new_end = int(data[0][0]) - 1
+            if end is not None and new_end >= end: break
+            end = new_end
             if len(data) < 1500: break
-    except Exception as _ex: log.debug('ignored: %s', _ex)
+    except Exception as ex:
+        log.warning("V10 history Binance %s %s exception: %s", sym, tf, str(ex)[:180])
     return out[-bars:] if out else None
+
+# Dedicated CCXT instances for linear perpetual history. The ordinary exchange
+# instances used elsewhere in the bot may be configured for spot markets.
+_v10_futures_ex = {}
+_v10_futures_locks = {}
+_v10_futures_init_lock = threading.Lock()
+_V10_FUTURE_EXCHANGES = [
+    ("bybit", "bybit", {"defaultType": "swap", "defaultSubType": "linear"}),
+    ("okx", "okx", {"defaultType": "swap"}),
+    ("kucoin", "kucoinfutures", {"defaultType": "swap"}),
+    ("gateio", "gateio", {"defaultType": "swap"}),
+    ("bitget", "bitget", {"defaultType": "swap"}),
+    ("mexc", "mexc", {"defaultType": "swap"}),
+    ("htx", "htx", {"defaultType": "swap"}),
+]
+
+def _v10_get_futures_exchange(exchange_id, options):
+    key = exchange_id
+    with _v10_futures_init_lock:
+        if key not in _v10_futures_ex:
+            cls = getattr(ccxt, exchange_id)
+            _v10_futures_ex[key] = cls({
+                "enableRateLimit": True, "timeout": 25000,
+                "options": dict(options),
+            })
+            _v10_futures_locks[key] = threading.Lock()
+    return _v10_futures_ex[key]
+
+def _v10_linear_swap_symbol(ex, base):
+    markets = ex.load_markets()
+    candidates = []
+    for market in markets.values():
+        if market.get("base") != base or market.get("quote") != "USDT":
+            continue
+        if not market.get("swap") or market.get("settle") != "USDT":
+            continue
+        if market.get("active") is False:
+            continue
+        candidates.append(market)
+    if not candidates:
+        raise PairNotFound(f"لا يوجد عقد USDT-M نشط لـ {base}")
+    candidates.sort(key=lambda m: (not bool(m.get("linear")), not bool(m.get("active", True))))
+    return candidates[0]["symbol"]
+
+def _v10_fetch_ccxt_futures_long(exchange_id, base, tf, bars, options):
+    ex = _v10_get_futures_exchange(exchange_id, options)
+    symbol = _v10_linear_swap_symbol(ex, base)
+    tfms = TF_MS[tf]
+    since = int(time.time() * 1000) - int(bars) * tfms
+    rows, last_seen = [], None
+    lock = _v10_futures_locks[exchange_id]
+    with lock:
+        # CCXT venues usually cap a single OHLCV request at 500-1000 bars.
+        # Paginate forward and reject non-advancing pages to avoid infinite loops.
+        for _ in range(min(120, int(bars / 200) + 10)):
+            chunk = ex.fetch_ohlcv(symbol, timeframe=tf, since=since, limit=1000)
+            if not chunk:
+                break
+            clean = []
+            for k in chunk:
+                if len(k) < 6 or k[0] is None: continue
+                clean.append([int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])])
+            if not clean: break
+            clean.sort(key=lambda x: x[0])
+            newest = clean[-1][0]
+            if last_seen is not None and newest <= last_seen:
+                break
+            rows.extend(clean)
+            last_seen = newest
+            since = newest + tfms
+            if len(rows) >= bars or newest + tfms >= int(time.time() * 1000):
+                break
+    # Normalize duplicate timestamps and keep only completed candles.
+    dedup = {r[0]: r for r in rows}
+    now_ms = int(time.time() * 1000)
+    out = [dedup[k] for k in sorted(dedup) if k + tfms <= now_ms]
+    return out[-bars:], f"{exchange_id}_linear_swap"
+
+def v10_futures_history(sym, tf, bars):
+    """Try Binance USD-M, then other linear perpetual venues; never use spot data."""
+    errors = []
+    minimum = {"4h": 210, "1h": 205, "15m": 60}.get(tf, 60)
+    rows = binance_futures_klines_long(sym, tf, bars)
+    if rows and len(rows) >= minimum:
+        return rows, "binance_usdm"
+    errors.append(f"binance: only {len(rows or [])}/{minimum} minimum bars")
+    for label, exchange_id, options in _V10_FUTURE_EXCHANGES:
+        try:
+            rows, source = _v10_fetch_ccxt_futures_long(exchange_id, sym, tf, bars, options)
+            if rows and len(rows) >= minimum:
+                log.info("V10 historical data %s %s from %s (%d bars)", sym, tf, source, len(rows))
+                return rows, source
+            errors.append(f"{label}: only {len(rows or [])} bars")
+        except Exception as ex:
+            errors.append(f"{label}: {type(ex).__name__}: {str(ex)[:100]}")
+            log.warning("V10 history fallback failed %s %s via %s: %s", sym, tf, label, str(ex)[:180])
+    raise NoData(f"{sym}: لا توجد بيانات Futures كافية لـ {tf}. " + " | ".join(errors[:5]))
 
 def _historical_ml_features_4h(hist):
     """Build only features knowable at this historical 4h close; no live orderflow leakage."""
@@ -3887,14 +3991,17 @@ def backtest_v10_symbol(sym, years=1.0):
     bars={"15m":int(years*365*96)+300,
           "1h":int(years*365*24)+300,
           "4h":int(years*365*6)+300}
-    frames={}
+    frames={}; data_sources={}
     for tf in ("4h","1h","15m"):
-        rows=binance_futures_klines_long(sym,tf,bars[tf])
-        if not rows: raise NoData(f"{sym}: لا توجد بيانات {tf} تاريخية من Binance Futures")
+        rows,source=v10_futures_history(sym,tf,bars[tf])
         raw=_rows_to_df(rows,tf,bars[tf])
         minimum={"4h":210,"1h":205,"15m":60}[tf]
-        if len(raw)<minimum: raise NoData(f"{sym}: بيانات {tf} غير كافية ({len(raw)}/{minimum})")
+        if len(raw)<minimum:
+            raise NoData(f"{sym}: بيانات Futures غير كافية لـ {tf} من {source} ({len(raw)}/{minimum})")
         frames[tf]=add_indicators(raw,100)
+        data_sources[tf]=source
+    # Record exact venue per timeframe; sources are never silently described as Binance.
+    source_summary=", ".join(f"{tf}:{src}" for tf,src in data_sources.items())
     d4,h1,m15=frames["4h"],frames["1h"],frames["15m"]
     t4=d4["t"].to_numpy(dtype="int64"); t1=h1["t"].to_numpy(dtype="int64"); t15=m15["t"].to_numpy(dtype="int64")
     start=204; n=len(h1)
@@ -3938,7 +4045,8 @@ def backtest_v10_symbol(sym, years=1.0):
                 cost=round(cost,4),grade=decision["grade"],score=decision.get("score",0),
                 side=side,setup=decision.get("setup","V10 MTF"),strategy="Ryma v10 Adaptive Hybrid",
                 entry=entry,sl=sl,tp=tps,data_start=int(t1[start]),data_end=int(t1[-1]),
-                signal_tf="1h",trigger_tf="15m",regime_tf="4h",data_source="binance_futures_api"))
+                signal_tf="1h",trigger_tf="15m",regime_tf="4h",data_source=source_summary,
+                data_sources=dict(data_sources)))
             next_allowed_ms=int(t15[exit_i])+TF_MS["15m"]
         except Exception as ex:
             log.warning("V10 MTF backtest failed %s at %s: %s",sym,i,str(ex)[:160])
