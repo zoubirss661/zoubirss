@@ -62,10 +62,10 @@ PAYMENT_INFO = _e("PAYMENT_INFO")
 PROTECT = _e("PROTECT_CONTENT", "1") == "1"
 # Adaptive AI layer (optional until a properly walk-forward-trained model is deployed)
 RYMA_AI_ENABLED = _e("RYMA_AI_ENABLED", "1") == "1"
-RYMA_AI_PROVIDER = _e("RYMA_AI_PROVIDER", "openai_compatible").lower()
+RYMA_AI_PROVIDER = "local_ml"  # forced: no remote AI/API calls in this build
 RYMA_AI_API_KEY = _e("RYMA_AI_API_KEY", _e("OPENAI_API_KEY"))
 RYMA_AI_BASE_URL = _e("RYMA_AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-RYMA_AI_MODEL = _e("RYMA_AI_MODEL", "gpt-4.1-mini")
+RYMA_AI_MODEL = "ryma-local-walkforward"
 RYMA_AI_TIMEOUT = max(15, _int("RYMA_AI_TIMEOUT", 45))
 RYMA_AI_MAX_TOKENS = max(300, min(3000, _int("RYMA_AI_MAX_TOKENS", 600)))
 # Free-tier protection: serialize calls, keep below the observed 8 RPM ceiling,
@@ -75,15 +75,15 @@ RYMA_AI_DAILY_CALL_CAP = max(1, _int("RYMA_AI_DAILY_CALL_CAP", 20))
 RYMA_AI_USAGE_PATH = _e("RYMA_AI_USAGE_PATH", "/app/ryma_ai_usage.json")
 RYMA_AI_BACKTEST_MAX_CALLS = max(10, min(3000, _int("RYMA_AI_BACKTEST_MAX_CALLS", 60)))
 RYMA_AI_TEMPERATURE = 0.1
-RYMA_ML_ENABLED = _e("RYMA_ML_ENABLED", "0") == "1"
-RYMA_ML_MODEL_PATH = _e("RYMA_ML_MODEL_PATH", "models/ryma_lgbm_calibrated.joblib")
-RYMA_ML_MIN_PROB = float(_e("RYMA_ML_MIN_PROB", "0.75"))
+RYMA_ML_ENABLED = True  # local model is the primary decision engine
+RYMA_ML_MODEL_PATH = "models/ryma_local_model.joblib"
+RYMA_ML_MIN_PROB = 0.55
 RYMA_AI_CACHE_TTL = max(60, _int("RYMA_AI_CACHE_TTL", 300))
 RYMA_AI_DECISION_CACHE_TTL = max(300, _int("RYMA_AI_DECISION_CACHE_TTL", 21600))
 RYMA_CVD_TRADES = max(100, min(1000, _int("RYMA_CVD_TRADES", 500)))
 MAINTENANCE = _e("MAINTENANCE", "0") == "1"
 BRAND = "💎 Ryma Crypto 💎"
-BOT_VERSION = "Ryma Crypto AI Signal v8.0-AI-FIRST · 2026-11-18"
+BOT_VERSION = "Ryma Crypto Local ML v9.0 · 2026-11-18"
 # PRINCIPLE: alerts & analysis only — never places exchange orders
 CYCLE_RADAR = 900
 WHALE_MIN_USD = 500000
@@ -912,28 +912,53 @@ def _ai_regime_from_df(df, timeframe):
     return result
 
 
-def _ai_predict_probability(features):
-    """Only returns probability from an explicitly deployed calibrated model."""
+def _ai_load_local_model():
+    """Load the versioned local model artifact; artifact contains estimator + feature schema."""
     if not RYMA_ML_ENABLED or _joblib is None or not os.path.isfile(RYMA_ML_MODEL_PATH):
         return None, "model_not_configured"
     try:
         mtime=os.path.getmtime(RYMA_ML_MODEL_PATH)
         if (_ai_model_cache["model"] is None or _ai_model_cache["path"]!=RYMA_ML_MODEL_PATH
                 or _ai_model_cache["mtime"]!=mtime):
-            model=_joblib.load(RYMA_ML_MODEL_PATH)
-            _ai_model_cache.update(path=RYMA_ML_MODEL_PATH,mtime=mtime,model=model,error=None)
-        model=_ai_model_cache["model"]
-        row=np.array([[float(features.get(k,0.0) or 0.0) for k in _AI_FEATURES]],dtype=float)
-        proba=model.predict_proba(row)[0]
-        classes=list(getattr(model,"classes_",[0,1]))
-        pos_idx=classes.index(1) if 1 in classes else len(proba)-1
-        return float(proba[pos_idx]), "calibrated_model"
+            artifact=_joblib.load(RYMA_ML_MODEL_PATH)
+            if isinstance(artifact,dict) and "model" in artifact:
+                model=artifact["model"]
+                features=list(artifact.get("features") or getattr(model,"feature_names_in_",_AI_FEATURES))
+                metrics=artifact.get("metrics",{})
+            else:
+                model=artifact
+                features=list(getattr(model,"feature_names_in_",_AI_FEATURES))
+                metrics={}
+            _ai_model_cache.update(path=RYMA_ML_MODEL_PATH,mtime=mtime,model={"estimator":model,"features":features,"metrics":metrics},error=None)
+        return _ai_model_cache["model"], "local_model_ready"
     except Exception as ex:
         _ai_model_cache["error"]=f"{type(ex).__name__}: {str(ex)[:120]}"
         return None, "model_error"
 
 
-def adaptive_ai_context(sym, df_1h=None, df_15m=None, deriv=None):
+def _ai_predict_distribution(features):
+    """Return calibrated class probabilities only when a trained local artifact exists."""
+    loaded,status=_ai_load_local_model()
+    if not loaded: return None,status
+    try:
+        model=loaded["estimator"]; names=loaded["features"]
+        row=pd.DataFrame([[float(features.get(k,0.0) or 0.0) for k in names]],columns=names)
+        probs=model.predict_proba(row)[0]
+        classes=list(getattr(model,"classes_",[-1,1]))
+        return {int(c):float(v) for c,v in zip(classes,probs)},status
+    except Exception as ex:
+        _ai_model_cache["error"]=f"{type(ex).__name__}: {str(ex)[:120]}"
+        return None,"model_error"
+
+
+def _ai_predict_probability(features):
+    """Compatibility field: probability of upward direction from the local classifier."""
+    distribution,status=_ai_predict_distribution(features)
+    if not distribution: return None,status
+    return float(distribution.get(1,0.0)),status
+
+
+def adaptive_ai_context(sym, df_1h=None, df_15m=None, deriv=None, primary_df=None):
     """Market regime + derivatives/tape features; never fabricates ML confidence."""
     now=time.time(); key=clean_symbol(sym)
     with _ai_context_lock:
@@ -947,7 +972,7 @@ def adaptive_ai_context(sym, df_1h=None, df_15m=None, deriv=None):
     flow=_ai_orderflow_snapshot(sym) if RYMA_AI_ENABLED else {}
     r1=_ai_regime_from_df(df_1h,"1h")
     r15=_ai_regime_from_df(df_15m,"15m")
-    df=df_1h if df_1h is not None and len(df_1h)>55 else df_15m
+    df=primary_df if primary_df is not None and len(primary_df)>55 else (df_1h if df_1h is not None and len(df_1h)>55 else df_15m)
     feat={k:0.0 for k in _AI_FEATURES}
     try:
         if df is not None and len(df)>=55:
@@ -1676,50 +1701,95 @@ def _risk_guard_levels(price, atr, side, proposed_sl=None, proposed_tps=None):
                     "frac":fracs[i],"hit":False,"src":"AI"} for i,px in enumerate(clean)]}
 
 
+def _ryma_local_ml_decision(sym, df, price, ai_context):
+    """Local ML is the directional decision-maker. No remote inference or API key required."""
+    features=(ai_context or {}).get("features") or {}
+    distribution,status=_ai_predict_distribution(features)
+    last=df.iloc[-1]
+    atr=float(last.get("atr",float(price)*0.01) or float(price)*0.01)
+    if not np.isfinite(atr) or atr<=0: atr=float(price)*0.01
+    warnings=[]
+    if distribution:
+        p_up=float(distribution.get(1,0.0)); p_down=float(distribution.get(-1,0.0))
+        side=1 if p_up>=p_down else -1
+        confidence=max(p_up,p_down)
+        grade="A" if confidence>=0.68 else ("B" if confidence>=max(RYMA_ML_MIN_PROB,0.55) else "C")
+        metrics=(_ai_model_cache.get("model") or {}).get("metrics",{})
+        if grade=="C": warnings.append("احتمال النموذج ضعيف؛ الإشارة اضطرارية ودرجة C.")
+        if metrics.get("holdout_balanced_accuracy") is not None:
+            warnings.append(f"دقة الاتجاه المتوازنة في اختبار زمني مستقل: {float(metrics['holdout_balanced_accuracy']):.1%}؛ ليست ضماناً للربح.")
+        reasons=[f"احتمال الصعود {p_up:.1%} مقابل الهبوط {p_down:.1%}.",
+                 "النموذج المحلي مدرّب على بيانات تاريخية مع فصل زمني للاختبار."]
+        model_name="Ryma Local ML"
+        setup="Local ML directional forecast"
+    else:
+        # Safe continuity mode: keep Telegram responsive, but clearly mark this as a
+        # transparent indicator fallback until the trained artifact is deployed.
+        close=pd.to_numeric(df["close"],errors="coerce")
+        e20=float(close.ewm(span=20,adjust=False).mean().iloc[-1])
+        e50=float(close.ewm(span=50,adjust=False).mean().iloc[-1])
+        rsi_v=float(add_indicators(df.copy(),50)["rsi"].iloc[-1])
+        mom=float(close.pct_change(4).iloc[-1] or 0.0)
+        score=(1 if e20>e50 else -1)+(1 if mom>0 else -1)+(1 if rsi_v>=50 else -1)
+        side=1 if score>=0 else -1
+        grade="C"
+        confidence=None
+        reasons=["النموذج المحلي المدرّب غير موجود بعد.","اتجاه مؤقت مبني على EMA والزخم وRSI فقط؛ ليس قرار ML."]
+        warnings=["تحذير: ملف النموذج غير موجود أو تعذر تحميله. هذه إشارة احتياطية بدرجة C وليست توقعاً من نموذج متعلم."]
+        model_name="Ryma Rule Fallback (untrained)"
+        setup="Temporary indicator fallback"
+    risk=min(max(atr*1.5,float(price)*0.003),float(price)*0.03)
+    sl=float(price)-side*risk
+    rr=(1.5,2.5,3.5,5.0)
+    targets=[float(price)+side*risk*x for x in rr]
+    lv={"entry":float(price),"sl":sl,"risk":risk,"atr":atr,
+        "tps":[{"px":px,"pct":round(100*side*(px-float(price))/float(price),3),
+                "frac":f,"hit":False,"src":"LOCAL_ML"} for px,f in zip(targets,(.50,.25,.15,.10))]}
+    return {"side":side,"grade":grade,"score":{"A":3,"B":2,"C":1}[grade],
+            "reasons":reasons,"warnings":warnings,"factors":{"local_model":model_name,
+            "prob_up":distribution.get(1) if distribution else None,
+            "prob_down":distribution.get(-1) if distribution else None},
+            "atr":atr,"lv":lv,"forced":grade=="C","strategy":model_name,
+            "confidence":confidence,"confidence_type":"model_probability" if distribution else "unavailable",
+            "setup":setup,"invalidation":"إغلاق شمعة الإطار أسفل/أعلى مستوى الوقف حسب اتجاه الصفقة."}
+
+
 def _ryma_ai_decision(sym, df, df_1h, df_15m, price, deriv, ai_context):
-    """LLM is the sole signal decision-maker. No legacy strategy fallback."""
+    """Select local ML by default; remote LLM is opt-in only via explicit provider setting."""
     base=df
     if base is None or len(base)<60 or not np.isfinite(float(price)) or float(price)<=0:
         raise NoData(sym)
     last=base.iloc[-1]
-    atr=float(last.get("atr",float(price)*0.01))
-    if not np.isfinite(atr) or atr<=0: atr=float(price)*0.01
-    cache_key=(clean_symbol(sym),str((ai_context or {}).get("timeframe") or default_tf(sym)),int(last.get("t",0) or 0),len(base),RYMA_AI_MODEL)
+    decision_tf=(ai_context or {}).get("timeframe") or default_tf(sym)
+    cache_key=(clean_symbol(sym),str(decision_tf),int(last.get("t",0) or 0),len(base),RYMA_AI_PROVIDER,
+                os.path.getmtime(RYMA_ML_MODEL_PATH) if os.path.isfile(RYMA_ML_MODEL_PATH) else 0)
     hit=_ai_decision_cache.get(cache_key)
     if hit and time.time()-hit[0]<RYMA_AI_DECISION_CACHE_TTL: return dict(hit[1])
-    decision_tf=(ai_context or {}).get("timeframe") or default_tf(sym)
-    payload={"symbol":clean_symbol(sym),"decision_timeframe":decision_tf,
-      "last_closed_price":float(price),"market_data":{"4h_or_primary":_ai_frame_snapshot(df,18),
-      "1h":_ai_frame_snapshot(df_1h,12),"15m":_ai_frame_snapshot(df_15m,12)},
-      "derivatives":deriv if isinstance(deriv,dict) else {},
-      "orderflow_and_regime":ai_context if isinstance(ai_context,dict) else {},
-      "constraints":{"direction":"BUY or SELL; always choose the less-bad direction when evidence is weak",
-      "grade":"A, B or C; C is mandatory when evidence is weak/conflicting",
-      "entry":"must equal last_closed_price","stop_loss":"must be on the loss side and no farther than 3% from entry",
-      "targets":"exactly four ascending for BUY / descending for SELL, positive prices",
-      "never":"do not invent unavailable data, do not output a win probability, do not claim certainty"}}
-    system=("You are Ryma Crypto's market-decision model. Analyze the supplied market data and make the only directional signal decision. "
-      "Return ONLY valid JSON with keys: side (BUY/SELL), grade (A/B/C), rationale (array of short strings), warnings (array), "
-      "stop_loss (number), targets (array of exactly 4 numbers), setup (short string), invalidation (short string). "
-      "Always choose BUY or SELL if market data is valid; if uncertain choose the less-conflicted direction and grade C with explicit warnings. "
-      "Do not invent orderflow/derivatives values. Entry is the supplied last closed price. Stop must be beyond entry in the losing direction and within 3%. "
-      "Targets must be beyond entry in profit direction and progressively farther away. No probability or guaranteed-return claims.")
-    answer=_ai_chat_completion(system,payload)
-    side_text=str(answer.get("side","")).upper()
-    if side_text not in ("BUY","SELL"): raise ValueError("AI returned invalid side")
-    side=1 if side_text=="BUY" else -1
-    grade=str(answer.get("grade","C")).upper()
-    if grade not in ("A","B","C"): grade="C"
-    lv=_risk_guard_levels(float(price),atr,side,answer.get("stop_loss"),answer.get("targets"))
-    warnings=[str(x)[:240] for x in (answer.get("warnings") or [])[:8]]
-    reasons=[str(x)[:240] for x in (answer.get("rationale") or [])[:8]]
-    if grade=="C": warnings.insert(0,"درجة C: الاتجاه اختير رغم ضعف/تعارض الأدلة؛ المخاطرة مرتفعة.")
-    if not reasons: reasons=["قرار النموذج مبني على بيانات السوق المرفقة."]
-    result={"side":side,"grade":grade,"score":{"A":3,"B":2,"C":1}[grade],
-      "reasons":reasons,"warnings":warnings,"factors":{"ai_model":RYMA_AI_MODEL},
-      "atr":atr,"lv":lv,"forced":grade=="C","strategy":"Ryma AI Decision",
-      "confidence":None,"confidence_type":"not_calibrated","setup":str(answer.get("setup","AI Market Read"))[:100],
-      "invalidation":str(answer.get("invalidation",""))[:240]}
+    if RYMA_AI_PROVIDER in ("openai_compatible","gemini","remote") and RYMA_AI_API_KEY:
+        atr=float(last.get("atr",float(price)*0.01) or float(price)*0.01)
+        payload={"symbol":clean_symbol(sym),"decision_timeframe":decision_tf,
+          "last_closed_price":float(price),"market_data":{"primary":_ai_frame_snapshot(df,18),
+          "1h":_ai_frame_snapshot(df_1h,12),"15m":_ai_frame_snapshot(df_15m,12)},
+          "derivatives":deriv if isinstance(deriv,dict) else {},
+          "orderflow_and_regime":ai_context if isinstance(ai_context,dict) else {},
+          "constraints":{"direction":"BUY or SELL","entry":"equal last closed price",
+          "targets":"exactly four","stop_loss":"within 3%"}}
+        system=("Return only JSON keys side BUY/SELL, grade A/B/C, rationale array, warnings array, stop_loss number, targets array of four numbers, setup and invalidation. Never invent data.")
+        answer=_ai_chat_completion(system,payload)
+        side_text=str(answer.get("side","BUY")).upper()
+        if side_text not in ("BUY","SELL"): raise ValueError("AI returned invalid side")
+        side=1 if side_text=="BUY" else -1
+        grade=str(answer.get("grade","C")).upper()
+        if grade not in ("A","B","C"): grade="C"
+        lv=_risk_guard_levels(float(price),atr,side,answer.get("stop_loss"),answer.get("targets"))
+        result={"side":side,"grade":grade,"score":{"A":3,"B":2,"C":1}[grade],
+          "reasons":[str(x)[:240] for x in (answer.get("rationale") or [])[:8]],
+          "warnings":[str(x)[:240] for x in (answer.get("warnings") or [])[:8]],
+          "factors":{"ai_model":RYMA_AI_MODEL},"atr":atr,"lv":lv,"forced":grade=="C",
+          "strategy":"Ryma Remote AI Decision","confidence":None,"confidence_type":"not_calibrated",
+          "setup":str(answer.get("setup","AI Market Read"))[:100],"invalidation":str(answer.get("invalidation",""))[:240]}
+    else:
+        result=_ryma_local_ml_decision(sym,base,float(price),ai_context)
     if len(_ai_decision_cache)>500: _ai_decision_cache.clear()
     _ai_decision_cache[cache_key]=(time.time(),dict(result))
     return result
@@ -1746,7 +1816,7 @@ def analyze(sym):
     try: deriv=derivatives_snapshot(sym)
     except Exception as ex:
         log.debug("derivatives unavailable %s: %s",sym,ex); deriv={}
-    try: ai_context=adaptive_ai_context(sym,df_1h,df_15m,deriv)
+    try: ai_context=adaptive_ai_context(sym,df_1h,df_15m,deriv,primary_df=df)
     except Exception as ex:
         log.warning("AI context partial for %s: %s",sym,ex); ai_context={"notes":["بيانات مشتقات/تدفق غير مكتملة"]}
     df_1h_ai=add_indicators(df_1h,100) if df_1h is not None and len(df_1h)>=60 and df_1h is not df else df
@@ -4434,7 +4504,7 @@ async def cmd_debug(update,ctx):
         f"📊 MAX_OPEN: {MAX_OPEN} | نشطة: {len(active_signals())}",
         f"📝 posted: {len(store.data['posted'])}",
         f"📡 Binance Futures API: {BINANCE_FAPI_BASE}",
-        f"🤖 AI: {RYMA_AI_PROVIDER} / {RYMA_AI_MODEL} | Key: {'OK' if RYMA_AI_API_KEY else 'MISSING'}",
+        f"🤖 محرك القرار: {RYMA_AI_PROVIDER} / {RYMA_AI_MODEL} | النموذج المحلي: {'جاهز' if os.path.isfile(RYMA_ML_MODEL_PATH) else 'بانتظار التدريب'}",
         f"💎 AI Golden scan: كل {CYCLE_GOLDEN//3600}س | Model: {RYMA_AI_MODEL}",
         f"🕯️ Patterns: MTF (1D+4H+1H) ✅",
         f"🎯 Points: {VIP_THRESHOLD}=VIP{VIP_REWARD_DAYS}d | +{POINTS_REFERRAL}/referral"]
@@ -4468,7 +4538,7 @@ def _runtime_health_report():
             if v!="ok": lines.append(f"  • {k}: {str(v)[:70]}")
     except Exception as ex:
         lines.append(f"المشتقات: FAIL — {type(ex).__name__}: {str(ex)[:100]}")
-    lines.append(f"AI Provider: {RYMA_AI_PROVIDER} | Model: {RYMA_AI_MODEL} | API key: {'OK' if RYMA_AI_API_KEY else 'MISSING'}")
+    lines.append(f"Decision Engine: {RYMA_AI_PROVIDER} | Local model: {'READY' if os.path.isfile(RYMA_ML_MODEL_PATH) else 'NOT TRAINED'}")
     lines.append(f"AI cache: {len(_ai_decision_cache)} | AI daily cap: {RYMA_AI_DAILY_CALL_CAP} | min interval: {RYMA_AI_MIN_INTERVAL}s")
     try:
         _u=_ai_usage_read(); lines.append(f"AI requests today (UTC): {_u.get('calls',0)}/{RYMA_AI_DAILY_CALL_CAP}")
