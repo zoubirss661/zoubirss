@@ -83,7 +83,7 @@ RYMA_AI_DECISION_CACHE_TTL = max(300, _int("RYMA_AI_DECISION_CACHE_TTL", 21600))
 RYMA_CVD_TRADES = max(100, min(1000, _int("RYMA_CVD_TRADES", 500)))
 MAINTENANCE = _e("MAINTENANCE", "0") == "1"
 BRAND = "💎 Ryma Crypto 💎"
-BOT_VERSION = "Ryma Crypto v9.3 Exit-Parity Research · 2026-11-18"
+BOT_VERSION = "Ryma Crypto v10 Adaptive Hybrid Engine RC1 · 2026-11-18"
 # PRINCIPLE: alerts & analysis only — never places exchange orders
 CYCLE_RADAR = 900
 WHALE_MIN_USD = 500000
@@ -1762,6 +1762,81 @@ def _ryma_local_ml_decision(sym, df, price, ai_context):
             "setup":setup,"invalidation":"إغلاق شمعة الإطار أسفل/أعلى مستوى الوقف حسب اتجاه الصفقة."}
 
 
+def _ryma_v10_hybrid_decision(sym, df_1h, df_15m, price, ai_context):
+    """Adaptive MTF engine: 4H regime, 1H confirmation, 15M liquidity/retest trigger.
+    Direction is always returned for continuity; weak setups are explicitly Grade C.
+    """
+    d4=(ai_context or {}).get("_df_4h")
+    if d4 is None or len(d4)<210: raise NoData(f"{sym}: 4H context unavailable")
+    if df_1h is None or len(df_1h)<205: raise NoData(f"{sym}: 1H context unavailable")
+    if df_15m is None or len(df_15m)<60: raise NoData(f"{sym}: 15M trigger context unavailable")
+    d4=add_indicators(d4,100) if "ema200" not in d4.columns else d4
+    h1=add_indicators(df_1h,100) if "ema200" not in df_1h.columns else df_1h
+    m15=add_indicators(df_15m,50) if "ema200" not in df_15m.columns else df_15m
+    a,b,c=d4.iloc[-1],h1.iloc[-1],m15.iloc[-1]
+    # 4H regime: EMA structure plus close position; ADX is computed from OHLC.
+    def adx_value(x, period=14):
+        high=x["high"].astype(float); low=x["low"].astype(float); close=x["close"].astype(float)
+        up=high.diff(); down=-low.diff()
+        plus=pd.Series(np.where((up>down)&(up>0),up,0.0),index=x.index)
+        minus=pd.Series(np.where((down>up)&(down>0),down,0.0),index=x.index)
+        tr=true_range(x)
+        atr=wilder(tr,period).replace(0,np.nan)
+        pdi=100*wilder(plus,period)/atr; mdi=100*wilder(minus,period)/atr
+        dx=100*(pdi-mdi).abs()/(pdi+mdi).replace(0,np.nan)
+        z=wilder(dx,period).iloc[-1]
+        return float(z) if np.isfinite(z) else 0.0
+    adx4=adx_value(d4)
+    bull4=(float(a["ema50"])>float(a["ema200"]) and float(a["close"])>float(a["ema50"]))
+    bear4=(float(a["ema50"])<float(a["ema200"]) and float(a["close"])<float(a["ema50"]))
+    bull1=(float(b["ema20"])>float(b["ema50"]) and float(b["close"])>float(b["ema50"]) and float(b["macd_hist"])>0)
+    bear1=(float(b["ema20"])<float(b["ema50"]) and float(b["close"])<float(b["ema50"]) and float(b["macd_hist"])<0)
+    # Pick the dominant 4H side even when confirmation is incomplete; Grade C warns.
+    if bull4 and not bear4: side=1
+    elif bear4 and not bull4: side=-1
+    else:
+        side=1 if float(a["ema50"])>=float(a["ema200"]) else -1
+    # Liquidity sweep/reclaim OR breakout/retest proxy on the last closed 15m candle.
+    prev=m15.iloc[-21:-1]
+    prior_hi=float(prev["high"].max()); prior_lo=float(prev["low"].min())
+    low_sweep=float(c["low"])<prior_lo and float(c["close"])>prior_lo and float(c["close"])>float(c["open"])
+    high_sweep=float(c["high"])>prior_hi and float(c["close"])<prior_hi and float(c["close"])<float(c["open"])
+    breakout_up=float(c["close"])>prior_hi and float(c["rvol"] or 0)>=1.15
+    breakout_dn=float(c["close"])<prior_lo and float(c["rvol"] or 0)>=1.15
+    rsi15=float(c["rsi"]) if np.isfinite(c["rsi"]) else 50.0
+    vol_ok=float(c["rvol"])>=1.0 if np.isfinite(c["rvol"]) else False
+    trigger=(low_sweep or breakout_up) if side==1 else (high_sweep or breakout_dn)
+    confirm=bull1 if side==1 else bear1
+    score=0
+    score+=2 if (bull4 if side==1 else bear4) else 0
+    score+=2 if confirm else 0
+    score+=2 if trigger else 0
+    score+=1 if adx4>=18 else 0
+    score+=1 if vol_ok else 0
+    score+=1 if ((45<=rsi15<=72) if side==1 else (28<=rsi15<=55)) else 0
+    grade="A" if score>=8 else ("B" if score>=6 else "C")
+    warnings=[]; reasons=[]
+    reasons.append(f"4H regime={'bullish' if bull4 else 'bearish' if bear4 else 'mixed'}; ADX={adx4:.1f}")
+    reasons.append(f"1H confirmation={'yes' if confirm else 'no'}")
+    reasons.append(f"15M trigger={'liquidity sweep/reclaim' if (low_sweep or high_sweep) else 'breakout' if (breakout_up or breakout_dn) else 'not confirmed'}")
+    if not confirm: warnings.append("تأكيد 1H غير مكتمل")
+    if not trigger: warnings.append("محفز 15M غير مكتمل؛ الإشارة اتجاهية للمراقبة فقط")
+    if adx4<18: warnings.append("ADX منخفض؛ السوق قد يكون عرضياً")
+    if grade=="C": warnings.append("Grade C: اتجاه اضطراري ضعيف، ليس دخولاً مؤكداً")
+    atr=float(c["atr"]) if np.isfinite(c["atr"]) and float(c["atr"])>0 else float(price)*0.004
+    risk=min(max(atr*1.6,float(price)*0.0035),float(price)*0.025)
+    lv={"entry":float(price),"sl":float(price)-side*risk,"risk":risk,"atr":atr,
+        "tps":[{"px":float(price)+side*risk*r,"pct":round(100*risk*r/float(price),3),"frac":f,"hit":False,"src":"V10_HYBRID"}
+               for r,f in zip((1.0,1.7,2.6,3.8),(.35,.30,.20,.15))]}
+    return {"side":side,"grade":grade,"score":score,"reasons":reasons,"warnings":warnings,
+            "factors":{"regime_4h":"bullish" if bull4 else "bearish" if bear4 else "mixed",
+                       "confirm_1h":bool(confirm),"trigger_15m":bool(trigger),"adx_4h":round(adx4,2),
+                       "rvol_15m":round(float(c["rvol"]),2) if np.isfinite(c["rvol"]) else None},
+            "atr":atr,"lv":lv,"forced":grade=="C","strategy":"Ryma v10 Adaptive Hybrid",
+            "confidence":None,"confidence_type":"not_calibrated",
+            "setup":"LGR / Breakout-Retest MTF","invalidation":"إغلاق 15M خلف مستوى الوقف"}
+
+
 def _ryma_ai_decision(sym, df, df_1h, df_15m, price, deriv, ai_context):
     """Select local ML by default; remote LLM is opt-in only via explicit provider setting."""
     base=df
@@ -1797,7 +1872,12 @@ def _ryma_ai_decision(sym, df, df_1h, df_15m, price, deriv, ai_context):
           "strategy":"Ryma Remote AI Decision","confidence":None,"confidence_type":"not_calibrated",
           "setup":str(answer.get("setup","AI Market Read"))[:100],"invalidation":str(answer.get("invalidation",""))[:240]}
     else:
-        result=_ryma_local_ml_decision(sym,base,float(price),ai_context)
+        # Keep /bt as a frozen 4H v9.3 reference until the full MTF archive is supplied.
+        # Live analysis uses v10; the old backtest path must never be mislabeled as v10.
+        if (ai_context or {}).get("backtest_mode"):
+            result=_ryma_local_ml_decision(sym,base,float(price),ai_context)
+        else:
+            result=_ryma_v10_hybrid_decision(sym,df_1h,df_15m,float(price),ai_context)
     if len(_ai_decision_cache)>500: _ai_decision_cache.clear()
     _ai_decision_cache[cache_key]=(time.time(),dict(result))
     return result
@@ -1805,18 +1885,17 @@ def _ryma_ai_decision(sym, df, df_1h, df_15m, price, deriv, ai_context):
 
 def analyze(sym):
     """AI-only live signal. Technical indicators are context/display, not a second signal engine."""
-    tf=default_tf(sym)
+    tf="1h"
     df_raw=get_candles(sym,tf,450)
     degraded=bool(df_raw.attrs.get("degraded")); source=df_raw.attrs.get("source","unknown")
     df=add_indicators(df_raw,100)
     if len(df)<220: raise NoData(f"{sym}: شموع غير كافية للتحليل")
     price=float(df["close"].iloc[-1])
     if not np.isfinite(price) or price<=0: raise NoData(sym)
-    df_1h=df_raw if tf=="1h" else None
-    df_15m=None; df_d=None
-    try:
-        if df_1h is None: df_1h=get_candles(sym,"1h",260,ttl=180,min_bars=100)
-    except Exception as ex: log.debug("1h context unavailable %s: %s",sym,ex)
+    df_1h=df_raw
+    df_15m=None; df_d=None; df_4h=None
+    try: df_4h=get_candles(sym,"4h",260,ttl=180,min_bars=100)
+    except Exception as ex: log.debug("4h regime unavailable %s: %s",sym,ex)
     try: df_15m=get_candles(sym,"15m",220,ttl=120,min_bars=80)
     except Exception as ex: log.debug("15m context unavailable %s: %s",sym,ex)
     try: df_d=get_candles(sym,"1d",260,ttl=300,min_bars=100)
@@ -1827,12 +1906,14 @@ def analyze(sym):
     try: ai_context=adaptive_ai_context(sym,df_1h,df_15m,deriv,primary_df=df)
     except Exception as ex:
         log.warning("AI context partial for %s: %s",sym,ex); ai_context={"notes":["بيانات مشتقات/تدفق غير مكتملة"]}
+    if df_4h is not None and len(df_4h)>=210:
+        ai_context["_df_4h"]=add_indicators(df_4h,100)
     # Publish the exact timeframe stack used for this market. Daily trend is
     # explicitly included for majors; 15m regime is emphasized for alts.
     tf_stack=ryma_timeframes(sym)
     ai_context["timeframe_stack"]=list(tf_stack)
     ai_context["regime_1d"]=_ai_regime_from_df(df_d,"1d") if "1d" in tf_stack and df_d is not None and len(df_d)>55 else None
-    ai_context["regime_4h"]=_ai_regime_from_df(df,"4h")
+    ai_context["regime_4h"]=_ai_regime_from_df(df_4h,"4h") if df_4h is not None else None
     ai_context["regime_1h"]=_ai_regime_from_df(df_1h,"1h") if df_1h is not None else None
     ai_context["regime_15m"]=_ai_regime_from_df(df_15m,"15m") if "15m" in tf_stack and df_15m is not None else None
     df_1h_ai=add_indicators(df_1h,100) if df_1h is not None and len(df_1h)>=60 and df_1h is not df else df
@@ -3783,7 +3864,7 @@ def bt_report(per,tmin,tmax,label,errors=None):
     lines = [f"📊 Backtest {label} ({len(per or {})} عملة صالحة) · {BOT_VERSION}",
              f"📥 العملات التي فشل تحميلها/اختبارها: {len(errors)}",
              "🧪 تقسيم TRAIN/TEST مستقل زمنياً لكل عملة.",
-             "⚠️ اختبار 4H بعينات أوسع؛ إدارة الخروج تحاكي TP الجزئي ثم BE بعد TP1 وTrailing بعد TP2 وحد 6 شموع. الرسوم/الانزلاق مقدّرة والتمويل غير مضمّن."]
+             "⚠️ هذا الأمر مرجع 4H التاريخي لمحرك v9.3 (وليس اختبار v10 متعدد الأطر). إدارة الخروج: TP جزئي ثم BE بعد TP1 وTrailing بعد TP2 وحد 6 شموع. الرسوم/الانزلاق مقدّرة والتمويل غير مضمّن."]
     if str(label).upper()=="TOP50":
         lines.append("⚠️ TOP50 مبنية على سيولة اليوم؛ ليست عينة تاريخية خالية من انحياز البقاء.")
     if not valid_range:
@@ -4754,6 +4835,7 @@ EXP_PACE=0.35               # ثوانٍ بين الطلبات: نحمي حد ا
 EXP_4H_BARS=11000           # ~5 سنوات
 EXP_1D_BARS=1900
 EXP_1H_BARS=13000           # ~1.5 سنة
+EXP_15M_BARS=17520          # ~6 أشهر فعلية لفريم الدخول
 EXP_FUND_YEARS=5.0
 EXP_ZIP_MAX=44*1024*1024    # حد تيليغرام للملف 50MB
 _EXP_BUSY=[False]
@@ -4804,8 +4886,9 @@ def exp_collect(syms,tmp,lite,progress=None):
     meta=dict(version=BOT_VERSION,created_utc=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
               lite=bool(lite),symbols={},failed=[])
     sets=[("4h","4h",14_400_000,EXP_4H_BARS if not lite else 6900),("1d","1d",86_400_000,EXP_1D_BARS)]
-    if not lite: sets.append(("1h","1h",3_600_000,EXP_1H_BARS))
-    for d_ in ("4h","1d","1h","funding"): os.makedirs(os.path.join(tmp,d_),exist_ok=True)
+    if not lite:
+        sets.extend([("1h","1h",3_600_000,EXP_1H_BARS),("15m","15m",900_000,EXP_15M_BARS)])
+    for d_ in ("4h","1d","1h","15m","funding"): os.makedirs(os.path.join(tmp,d_),exist_ok=True)
     for i,sy in enumerate(syms,1):
         if progress and (i==1 or i%3==0): progress(i,len(syms),sy)
         info={}
@@ -4833,6 +4916,7 @@ EXP_README="""Ryma research data (public Binance USDT-M futures data only)
 - Only CLOSED candles are included (the forming candle is dropped).
 - klines columns: t,open,high,low,close,volume,quote_volume,trades,taker_buy_base,taker_buy_quote
 - funding columns: fundingTime,fundingRate,markPrice (every 8h)
+- 15m history is about six months; 1h about 1.5 years; 4h/daily/funding about five years.
 - Symbols = top by current 24h volume (survivorship bias: coins that died are missing; new coins have short history).
 - meta.json lists bars per symbol, and `complete=false` if a download was cut short.
 """
@@ -4843,7 +4927,7 @@ def exp_zip(tmp,meta):
     with open(meta_path,"w",encoding="utf-8") as f: json.dump(meta,f,ensure_ascii=False,indent=1)
     readme=os.path.join(tmp,"README.txt")
     with open(readme,"w",encoding="utf-8") as f: f.write(EXP_README)
-    groups=[("ryma_4h",["4h"]),("ryma_1d_funding",["1d","funding"]),("ryma_1h",["1h"])]
+    groups=[("ryma_4h",["4h"]),("ryma_1d_funding",["1d","funding"]),("ryma_1h",["1h"]),("ryma_15m",["15m"])]
     outs=[]
     for base,dirs in groups:
         files=[]
@@ -4883,7 +4967,7 @@ async def cmd_exportdata(update,ctx):
     try:
         msg=await update.message.reply_text(
             "⏳ بدأ التصدير (%s). يأخذ حوالي %s، ويرسل الملفات في الآخر. لا تعيد الأمر."%(
-                BOT_VERSION,"4–6 دقائق" if lite else "10–15 دقيقة"))
+                BOT_VERSION,"4–6 دقائق" if lite else "15–25 دقيقة"))
         syms=await asyncio.to_thread(top_symbols,50)
         syms=["BTC"]+[x for x in syms if x!="BTC"]; syms=syms[:50]
         tmp=tempfile.mkdtemp(prefix="ryma_exp_")
