@@ -67,7 +67,12 @@ RYMA_AI_API_KEY = _e("RYMA_AI_API_KEY", _e("OPENAI_API_KEY"))
 RYMA_AI_BASE_URL = _e("RYMA_AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 RYMA_AI_MODEL = _e("RYMA_AI_MODEL", "gpt-4.1-mini")
 RYMA_AI_TIMEOUT = max(15, _int("RYMA_AI_TIMEOUT", 45))
-RYMA_AI_MAX_TOKENS = max(300, min(3000, _int("RYMA_AI_MAX_TOKENS", 1200)))
+RYMA_AI_MAX_TOKENS = max(300, min(3000, _int("RYMA_AI_MAX_TOKENS", 600)))
+# Free-tier protection: serialize calls, keep below the observed 8 RPM ceiling,
+# and cap daily requests. Values can be overridden in Railway if Google changes quotas.
+RYMA_AI_MIN_INTERVAL = max(5, _int("RYMA_AI_MIN_INTERVAL", 8))
+RYMA_AI_DAILY_CALL_CAP = max(1, _int("RYMA_AI_DAILY_CALL_CAP", 20))
+RYMA_AI_USAGE_PATH = _e("RYMA_AI_USAGE_PATH", "/app/ryma_ai_usage.json")
 RYMA_AI_BACKTEST_MAX_CALLS = max(10, min(3000, _int("RYMA_AI_BACKTEST_MAX_CALLS", 60)))
 RYMA_AI_TEMPERATURE = 0.1
 RYMA_ML_ENABLED = _e("RYMA_ML_ENABLED", "0") == "1"
@@ -1518,6 +1523,28 @@ def fib_levels(df,lookback=SR_LOOKBACK):
 _analysis_cache={}
 _ai_decision_cache={}
 _ai_http_session=requests.Session()
+_ai_api_lock=threading.Lock()
+_ai_last_request_at=0.0
+
+
+def _ai_usage_read():
+    """Small local usage ledger; protects against repeated scans/restarts in one deployment."""
+    today=dt.datetime.now(dt.timezone.utc).date().isoformat()
+    try:
+        with open(RYMA_AI_USAGE_PATH,"r",encoding="utf-8") as f: state=json.load(f)
+        if state.get("day")!=today: state={"day":today,"calls":0,"blocked_until":0}
+    except Exception:
+        state={"day":today,"calls":0,"blocked_until":0}
+    return state
+
+
+def _ai_usage_write(state):
+    try:
+        tmp=RYMA_AI_USAGE_PATH+".tmp"
+        with open(tmp,"w",encoding="utf-8") as f: json.dump(state,f)
+        os.replace(tmp,RYMA_AI_USAGE_PATH)
+    except Exception as ex:
+        log.warning("AI usage ledger could not be saved: %s",type(ex).__name__)
 
 
 def engine_direction(sym, price=None):
@@ -1556,6 +1583,8 @@ def _ai_json_from_response(text_value):
 
 
 def _ai_chat_completion(system_prompt, user_payload):
+    """Quota-aware Gemini call. No legacy strategy fallback is performed."""
+    global _ai_last_request_at
     if not RYMA_AI_ENABLED:
         raise RuntimeError("RYMA_AI_ENABLED=0: AI signal engine is disabled")
     if not RYMA_AI_API_KEY:
@@ -1567,15 +1596,45 @@ def _ai_chat_completion(system_prompt, user_payload):
           "response_format":{"type":"json_object"},
           "messages":[{"role":"system","content":system_prompt},
                       {"role":"user","content":json.dumps(user_payload,ensure_ascii=False,separators=(",",":"),default=str)}]}
-    response=_ai_http_session.post(url,headers=headers,json=body,timeout=RYMA_AI_TIMEOUT)
-    if response.status_code>=400:
-        raise RuntimeError(f"AI API HTTP {response.status_code}: {response.text[:300]}")
-    data=response.json()
-    content=data.get("choices",[{}])[0].get("message",{}).get("content")
-    if isinstance(content,list):
-        content="".join(x.get("text","") for x in content if isinstance(x,dict))
-    if not content: raise RuntimeError("AI API returned an empty answer")
-    return _ai_json_from_response(content)
+    # One request at a time: concurrent scans must not burst the free RPM quota.
+    with _ai_api_lock:
+        state=_ai_usage_read(); now=time.time()
+        if now<float(state.get("blocked_until",0) or 0):
+            wait=int(float(state["blocked_until"])-now)
+            raise RuntimeError(f"Gemini free quota pause is active ({max(1,wait//60)} min remaining); no paid fallback used.")
+        if int(state.get("calls",0))>=RYMA_AI_DAILY_CALL_CAP:
+            raise RuntimeError(f"تم بلوغ حد Ryma اليومي الوقائي ({RYMA_AI_DAILY_CALL_CAP} طلب AI). انتظر إعادة ضبط الحصة المجانية.")
+        delay=RYMA_AI_MIN_INTERVAL-(now-_ai_last_request_at)
+        if delay>0: time.sleep(delay)
+        state["calls"]=int(state.get("calls",0))+1
+        _ai_usage_write(state)
+        response=None
+        for attempt in range(3):
+            try:
+                response=_ai_http_session.post(url,headers=headers,json=body,timeout=RYMA_AI_TIMEOUT)
+            except requests.RequestException:
+                if attempt>=2: raise
+                time.sleep((5,15)[attempt]); continue
+            if response.status_code==503 and attempt<2:
+                # Temporary Google overload: short exponential backoff, maximum 3 attempts.
+                time.sleep((5,15)[attempt]); continue
+            break
+        _ai_last_request_at=time.time()
+        if response is None: raise RuntimeError("Gemini did not return a response")
+        if response.status_code==429:
+            # The observed message is a quota-exhaustion response; pause until next UTC day.
+            tomorrow=dt.datetime.now(dt.timezone.utc).date()+dt.timedelta(days=1)
+            reset=dt.datetime.combine(tomorrow,dt.time.min,tzinfo=dt.timezone.utc).timestamp()+300
+            state["blocked_until"]=reset; _ai_usage_write(state)
+            raise RuntimeError(f"AI API HTTP 429: تم إيقاف طلبات Gemini حتى تجدد الحصة المجانية. {response.text[:220]}")
+        if response.status_code>=400:
+            raise RuntimeError(f"AI API HTTP {response.status_code}: {response.text[:300]}")
+        data=response.json()
+        content=data.get("choices",[{}])[0].get("message",{}).get("content")
+        if isinstance(content,list):
+            content="".join(x.get("text","") for x in content if isinstance(x,dict))
+        if not content: raise RuntimeError("AI API returned an empty answer")
+        return _ai_json_from_response(content)
 
 
 def _risk_guard_levels(price, atr, side, proposed_sl=None, proposed_tps=None):
@@ -1630,8 +1689,8 @@ def _ryma_ai_decision(sym, df, df_1h, df_15m, price, deriv, ai_context):
     if hit and time.time()-hit[0]<RYMA_AI_DECISION_CACHE_TTL: return dict(hit[1])
     decision_tf=(ai_context or {}).get("timeframe") or default_tf(sym)
     payload={"symbol":clean_symbol(sym),"decision_timeframe":decision_tf,
-      "last_closed_price":float(price),"market_data":{"4h_or_primary":_ai_frame_snapshot(df,30),
-      "1h":_ai_frame_snapshot(df_1h,24),"15m":_ai_frame_snapshot(df_15m,24)},
+      "last_closed_price":float(price),"market_data":{"4h_or_primary":_ai_frame_snapshot(df,18),
+      "1h":_ai_frame_snapshot(df_1h,12),"15m":_ai_frame_snapshot(df_15m,12)},
       "derivatives":deriv if isinstance(deriv,dict) else {},
       "orderflow_and_regime":ai_context if isinstance(ai_context,dict) else {},
       "constraints":{"direction":"BUY or SELL; always choose the less-bad direction when evidence is weak",
@@ -4410,7 +4469,10 @@ def _runtime_health_report():
     except Exception as ex:
         lines.append(f"المشتقات: FAIL — {type(ex).__name__}: {str(ex)[:100]}")
     lines.append(f"AI Provider: {RYMA_AI_PROVIDER} | Model: {RYMA_AI_MODEL} | API key: {'OK' if RYMA_AI_API_KEY else 'MISSING'}")
-    lines.append(f"AI cache: {len(_ai_decision_cache)} | AI backtest cap/currency: {RYMA_AI_BACKTEST_MAX_CALLS} calls per symbol")
+    lines.append(f"AI cache: {len(_ai_decision_cache)} | AI daily cap: {RYMA_AI_DAILY_CALL_CAP} | min interval: {RYMA_AI_MIN_INTERVAL}s")
+    try:
+        _u=_ai_usage_read(); lines.append(f"AI requests today (UTC): {_u.get('calls',0)}/{RYMA_AI_DAILY_CALL_CAP}")
+    except Exception: pass
     lines.append(f"Cache: candles={len(_candle_cache)} | prices={len(_price_cache)} | derivatives={len(_derivatives_snapshot_cache)}")
     lines.append("ملاحظة: هذا فحص اتصال وصحة بيانات، وليس حكماً على ربحية الاستراتيجية.")
     return "\n".join(lines)
