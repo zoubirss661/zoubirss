@@ -83,7 +83,7 @@ RYMA_AI_DECISION_CACHE_TTL = max(300, _int("RYMA_AI_DECISION_CACHE_TTL", 21600))
 RYMA_CVD_TRADES = max(100, min(1000, _int("RYMA_CVD_TRADES", 500)))
 MAINTENANCE = _e("MAINTENANCE", "0") == "1"
 BRAND = "💎 Ryma Crypto 💎"
-BOT_VERSION = "Ryma Crypto v10 Adaptive Hybrid Engine RC2 · 2026-11-19"
+BOT_VERSION = "Ryma Crypto v10 Adaptive Hybrid Engine RC3 · 2026-11-19"
 # PRINCIPLE: alerts & analysis only — never places exchange orders
 CYCLE_RADAR = 900
 WHALE_MIN_USD = 500000
@@ -207,6 +207,40 @@ FUNDING_8H=0.0001                                                # funding estim
 ALLOW_C_POSTS=_e("ALLOW_C_POSTS","0")=="1"                      # grade C = unconfirmed direction: never published unless enabled
 BT_MAX_DECISIONS=max(200,min(50000,_int("BT_MAX_DECISIONS",20000)))
 SHADOW_MAX_OPEN=60
+
+# ===== v10 tunables: ONE parameter set shared by live signals, tracking and every backtest ========================
+V10_DEFAULTS=dict(stop_tf="15m",stop_k=1.6,min_adx=0.0,cooldown=0,rr="base")
+V10_RR_SETS={"base":(1.0,1.7,2.6,3.8),"runner":(1.5,2.5,4.0,6.0)}
+REAL_FEE=0.0005; REAL_SLIP=0.0002     # realistic majors cost (taker 0.05% + 0.02% slippage per side), shown next to the configured one
+
+def _v10_clean(p):
+    out=dict(V10_DEFAULTS); out.update(p or {})
+    if out["stop_tf"] not in ("15m","1h"): raise ValueError("stop_tf must be 15m or 1h")
+    out["stop_k"]=float(out["stop_k"]); out["min_adx"]=float(out["min_adx"]); out["cooldown"]=int(out["cooldown"])
+    if not 0.5<=out["stop_k"]<=3.0: raise ValueError("stop_k must be within 0.5..3")
+    if not 0<=out["min_adx"]<=40: raise ValueError("min_adx must be within 0..40")
+    if not 0<=out["cooldown"]<=96: raise ValueError("cooldown must be within 0..96 (15m bars)")
+    if out["rr"] not in V10_RR_SETS: raise ValueError("rr must be base or runner")
+    return out
+
+def v10_params(override=None):
+    p=dict(V10_DEFAULTS)
+    try:
+        with store.lock: p.update(store.data.get("settings",{}).get("v10_params") or {})
+    except Exception: pass
+    if override: p.update(override)
+    try: return _v10_clean(p)
+    except ValueError: return dict(V10_DEFAULTS)
+
+def in_cooldown(sym):
+    """After a LOSING real trade on a coin, skip that coin for `cooldown` 15m bars (same rule in /bt)."""
+    n=v10_params()["cooldown"]
+    if n<=0: return False
+    with store.lock:
+        h=[x for x in store.data.get("history",[]) if x.get("coin")==sym and not x.get("shadow") and x.get("setup")!="RADAR"]
+    if not h: return False
+    last=max(h,key=lambda x:x.get("closed") or 0)
+    return (last.get("R") or 0)<0 and int(time.time()*1000)-int(last.get("closed") or 0)<n*TF_MS["15m"]
 MIN_DAILY_VOLUME_USD=5_000_000; VIP_MIN_LIQUIDITY=3_000_000; RISK_SIZE={"A+":0.10,"A":0.08,"B":0.05,"C":0.02}
 PREDICT_BB_SQZ=0.75; PREDICT_VOL_BUILDUP=1.4; PREDICT_RSI_NEUTRAL=(42,58)
 PREDICT_OI_CHANGE_MIN=3.0; PREDICT_FUNDING_EXTREME=0.05; PREDICT_TOP_N=10; PREDICT_TF="4h"
@@ -1613,14 +1647,19 @@ def _ai_usage_write(state):
 
 
 
-def v10_levels(price,side,atr):
+
+def v10_levels(price,side,atr,atr_1h=None,params=None):
     """The ONLY place where v10 stop/targets are built (decision, live tracking and backtest share it)."""
+    prm=params or v10_params()
     price=float(price); side=int(side)
     atr=float(atr) if atr is not None and np.isfinite(atr) and float(atr)>0 else price*0.004
-    risk=min(max(atr*V10_ATR_MULT,price*V10_RISK_MIN_PCT),price*V10_RISK_MAX_PCT)
+    ref=atr
+    if prm["stop_tf"]=="1h" and atr_1h is not None and np.isfinite(atr_1h) and float(atr_1h)>0: ref=float(atr_1h)
+    risk=min(max(ref*prm["stop_k"],price*V10_RISK_MIN_PCT),price*V10_RISK_MAX_PCT)
+    rr=V10_RR_SETS[prm["rr"]]
     return {"entry":price,"sl":price-side*risk,"risk":risk,"atr":atr,
             "tps":[{"px":price+side*risk*r,"pct":round(100*risk*r/price,3),"frac":f,"hit":False,"src":"V10_HYBRID"}
-                   for r,f in zip(V10_RR,V10_FRACS)]}
+                   for r,f in zip(rr,V10_FRACS)]}
 
 
 def _v10_trigger_mask(m15):
@@ -1633,10 +1672,11 @@ def _v10_trigger_mask(m15):
     return (low_sweep|brk_up|high_sweep|brk_dn)
 
 
-def _ryma_v10_hybrid_decision(sym, df_1h, df_15m, price, ai_context):
+def _ryma_v10_hybrid_decision(sym, df_1h, df_15m, price, ai_context, params=None):
     """Ryma v10 Adaptive Hybrid: 4H regime + 1H confirmation + 15M liquidity trigger.
     An OPPORTUNITY needs all three (regime aligned, 1H confirmed, fresh 15M trigger). Anything less is a
     RADAR reading (setup forming) and is graded C, so it can never be mistaken for a confirmed entry."""
+    prm=params or v10_params()
     d4=(ai_context or {}).get("_df_4h")
     if d4 is None or len(d4)<210: raise NoData(f"{sym}: 4H context unavailable")
     if df_1h is None or len(df_1h)<205: raise NoData(f"{sym}: 1H context unavailable")
@@ -1673,7 +1713,7 @@ def _ryma_v10_hybrid_decision(sym, df_1h, df_15m, price, ai_context):
     score+=1 if adx4>=18 else 0
     score+=1 if vol_ok else 0
     score+=1 if ((45<=rsi15<=72) if side==1 else (28<=rsi15<=55)) else 0
-    opportunity=bool(regime_ok and confirm and trigger)
+    opportunity=bool(regime_ok and confirm and trigger and adx4>=prm["min_adx"])
     grade=("A" if score>=8 else "B") if opportunity else "C"
     warnings=[]
     reasons=[f"4H regime={'bullish' if bull4 else 'bearish' if bear4 else 'mixed'}; ADX={adx4:.1f}",
@@ -1682,15 +1722,16 @@ def _ryma_v10_hybrid_decision(sym, df_1h, df_15m, price, ai_context):
     if not regime_ok: warnings.append("نظام 4H غير متوافق مع الاتجاه")
     if not confirm: warnings.append("تأكيد 1H غير مكتمل")
     if not trigger: warnings.append("محفز 15M غير مكتمل؛ هذه قراءة رادار للمراقبة وليست فرصة")
-    if adx4<18: warnings.append("ADX منخفض؛ السوق قد يكون عرضياً")
+    if adx4<max(18,prm["min_adx"]): warnings.append("ADX منخفض؛ السوق قد يكون عرضياً أو أقل من الحد المطلوب")
     if not opportunity: warnings.append("ليست فرصة مؤكدة (درجة C): الشروط الثلاثة غير متوفرة معاً")
     atr=float(c["atr"]) if np.isfinite(c["atr"]) and float(c["atr"])>0 else float(price)*0.004
-    lv=v10_levels(price,side,atr)
+    atr_1h=float(b["atr"]) if np.isfinite(b["atr"]) else None
+    lv=v10_levels(price,side,atr,atr_1h,prm)
     return {"side":side,"grade":grade,"score":score,"opportunity":opportunity,"reasons":reasons,"warnings":warnings,
             "factors":{"regime_4h":"bullish" if bull4 else "bearish" if bear4 else "mixed",
                        "regime_aligned":bool(regime_ok),"confirm_1h":bool(confirm),"trigger_15m":bool(trigger),
                        "adx_4h":round(adx4,2),"rvol_15m":round(rv,2) if rv else None},
-            "atr":atr,"lv":lv,"forced":not opportunity,"strategy":"Ryma v10 Adaptive Hybrid",
+            "atr":atr,"atr_1h":atr_1h,"lv":lv,"forced":not opportunity,"strategy":"Ryma v10 Adaptive Hybrid",
             "confidence":None,"confidence_type":"not_calibrated",
             "setup":"LGR / Breakout MTF","invalidation":"إغلاق 15M خلف مستوى الوقف"}
 
@@ -3012,7 +3053,7 @@ def active_signals(include_shadow=False):
                 and (include_shadow or not _is_shadow(p))]
 
 def can_track(res):
-    if res["sym"] in WEAK_COINS: return False
+    if res["sym"] in WEAK_COINS or in_cooldown(res["sym"]): return False
     act=active_signals()
     if len(act)>=MAX_OPEN: return False
     return not any(p["coin"]==res["sym"] for p in act)
@@ -3116,7 +3157,7 @@ _free_day={"d":"","n":0}
 def _can_post(r):
     key=f"{r['sym']}:{r['tf']}:{r['bar_t']}"
     if key in store.data["posted"]: return False
-    if recently_posted(r["sym"],6): return False
+    if recently_posted(r["sym"],6) or in_cooldown(r["sym"]): return False
     act=active_signals()
     if len(act)>=MAX_OPEN: return False
     return not any(p["coin"]==r["sym"] for p in act)
@@ -3681,13 +3722,13 @@ def _v10_visible(t1,t4,sig_close):
             int(np.searchsorted(t4,sig_close-TF_MS["4h"],side="right")))
 
 
-def v10_replay(sym,d4,h1,m15,max_decisions=None):
+def v10_replay(sym,d4,h1,m15,max_decisions=None,params=None):
     """Replay the LIVE engine on every closed 15m candle, then manage each trade with the SAME trade_step as live.
     - decision sees only candles already closed at that moment (4H/1H/15M clipped to the signal time)
     - entry = open of the next 15m candle (live: the 15m close ~ the same price), costs = trade_cost_r (fees+slip+funding est.)
     - one open trade per symbol; only CONFIRMED opportunities are traded (same rule as autopost)
     Returns (trades, data_start_ms, data_end_ms)."""
-    max_decisions=int(max_decisions or BT_MAX_DECISIONS)
+    max_decisions=int(max_decisions or BT_MAX_DECISIONS); prm=params or v10_params()
     t4=d4["t"].to_numpy(dtype="int64"); t1=h1["t"].to_numpy(dtype="int64"); t15=m15["t"].to_numpy(dtype="int64")
     if len(t1)<206 or len(t4)<211 or len(t15)<100: return [],0,0
     mask=_v10_trigger_mask(m15).to_numpy()
@@ -3705,11 +3746,11 @@ def v10_replay(sym,d4,h1,m15,max_decisions=None):
         if e1<205 or e4<210: continue
         calls+=1
         if calls>max_decisions: break
-        try: dec=_ryma_v10_hybrid_decision(sym,h1.iloc[:e1],m15.iloc[:j+1],float(c15[j]),{"_df_4h":d4.iloc[:e4]})
+        try: dec=_ryma_v10_hybrid_decision(sym,h1.iloc[:e1],m15.iloc[:j+1],float(c15[j]),{"_df_4h":d4.iloc[:e4]},prm)
         except NoData: continue
         if not dec["opportunity"]: continue
         side=int(dec["side"]); entry_i=j+1
-        fill=float(o15[entry_i]); lv=v10_levels(fill,side,dec["atr"])
+        fill=float(o15[entry_i]); lv=v10_levels(fill,side,dec["atr"],dec.get("atr_1h"),prm)
         p=new_trade(sym,V10_EXEC_TF,side,lv,int(t15[j]),dec["grade"],dec.get("setup","V10"))
         k=entry_i
         while k<len(t15) and p["state"] in ("pending","open"):
@@ -3720,14 +3761,15 @@ def v10_replay(sym,d4,h1,m15,max_decisions=None):
         trades.append(dict(coin=sym,sym=sym,t=int(t15[entry_i]),signal_t=sig_close,R=p["R"],gross_R=gross,
             exit=p["result"],bars=p["bars"],tps=sum(1 for x in p["tps"] if x["hit"]),cost=round(gross-p["R"],4),
             grade=dec["grade"],score=dec["score"],side=side,setup=dec.get("setup","V10"),
-            strategy="Ryma v10 Adaptive Hybrid",entry=fill,sl=lv["sl"],tp=[x["px"] for x in lv["tps"]],
+            strategy="Ryma v10 Adaptive Hybrid",risk_pct=round(100*lv["risk"]/fill,4),hours=p["bars"]*0.25,entry=fill,sl=lv["sl"],tp=[x["px"] for x in lv["tps"]],
             data_start=data_start,data_end=data_end,signal_tf="1h",trigger_tf="15m",regime_tf="4h"))
-        next_ok=int(t15[exit_i])+TF_MS["15m"]
+        next_ok=int(t15[exit_i])+TF_MS["15m"]+(prm["cooldown"]*TF_MS["15m"] if p["R"]<0 else 0)
     return trades,data_start,data_end
 
 
-def backtest_symbol(sym, years=1.0):
-    """Download 4H/1H/15M USDT-M futures history and replay the live v10 engine over it."""
+
+def _bt_frames(sym,years=1.0):
+    """Download 4H/1H/15M futures history once (shared by /bt and the optimiser)."""
     years=min(max(float(years),0.1),3.0)
     bars={"15m":int(years*365*96)+400,"1h":int(years*365*24)+300,"4h":int(years*365*6)+300}
     minimum={"4h":210,"1h":205,"15m":100}
@@ -3737,12 +3779,75 @@ def backtest_symbol(sym, years=1.0):
         raw=_rows_to_df(rows,tf,bars[tf])
         if len(raw)<minimum[tf]: raise NoData(f"{sym}: بيانات Futures غير كافية لـ {tf} من {source} ({len(raw)}/{minimum[tf]})")
         frames[tf]=add_indicators(raw,100); sources[tf]=source
-    trades,a,b=v10_replay(sym,frames["4h"],frames["1h"],frames["15m"])
-    summary=", ".join(f"{tf}:{s}" for tf,s in sources.items())
+    return frames["4h"],frames["1h"],frames["15m"],", ".join(f"{tf}:{s}" for tf,s in sources.items())
+
+
+def backtest_symbol(sym, years=1.0, params=None):
+    """Replay the live v10 engine (current live parameters unless `params` is given) over futures history."""
+    d4,h1,m15,summary=_bt_frames(sym,years)
+    trades,a,b=v10_replay(sym,d4,h1,m15,params=params)
     for tr in trades: tr["data_source"]=summary
     if not a: raise NoData(f"{sym}: تاريخ غير كافٍ للتشغيل")
     return trades,a,b
 
+
+V10_GRID=[dict(stop_tf=tf,stop_k=k,min_adx=adx,cooldown=cd,rr=rr)
+          for tf,k in (("15m",1.6),("1h",0.8),("1h",1.2),("1h",1.6))
+          for adx in (0,20,25) for cd in (0,16) for rr in ("base","runner")]
+
+
+def _real_cost_trades(trs):
+    """Same trades re-priced with realistic majors costs (REAL_FEE/REAL_SLIP) instead of the configured conservative ones."""
+    out=[]
+    for x in trs:
+        rp=max(float(x.get("risk_pct") or 0.5),1e-6)/100.0
+        cost=(2*(REAL_FEE+REAL_SLIP)+FUNDING_8H*float(x.get("hours",0))/8.0)/rp
+        out.append(dict(x,R=round(float(x["gross_R"])-cost,4)))
+    return out
+
+
+def v10_optimize(data,grid=None,progress=None):
+    """Walk-forward style grid search on ALREADY LOADED frames: rank by TRAIN only, then report TEST (never used to rank)."""
+    grid=grid or V10_GRID; rows=[]
+    for gi,raw in enumerate(grid):
+        prm=_v10_clean(raw); allt=[]; a=b=None
+        for sym,(d4,h1,m15,_) in data.items():
+            trs,s,e=v10_replay(sym,d4,h1,m15,params=prm)
+            allt+=trs
+            if s: a=s if a is None else min(a,s); b=e if b is None else max(b,e)
+        tr,te=split_trades_by_symbol(allt,a,b,0.65)
+        rows.append(dict(params=prm,train=metrics(tr),test=metrics(te),test_real=metrics(_real_cost_trades(te)),
+                         gross=round(float(np.mean([x["gross_R"] for x in te])),3) if te else 0.0))
+        if progress: progress(gi+1,len(grid))
+    return rows
+
+
+def opt_report(rows,syms,years,errors=None):
+    def fmt_p(p): return f"stop={p['stop_tf']}×{p['stop_k']:g} adx≥{p['min_adx']:g} cd={p['cooldown']} rr={p['rr']}"
+    base=rows[0]
+    elig=[r for r in rows[1:] if r["train"]["n"]>=150 and r["test"]["n"]>=60]
+    elig.sort(key=lambda r:r["train"]["avg"],reverse=True)
+    L=[f"🔬 Optimiser v10 · {len(syms)} عملة · {years:g} سنة · {len(rows)} تركيبة · {BOT_VERSION}",
+       "الترتيب حسب TRAIN فقط. TEST للتحقق ولم يُستعمل في الاختيار.",
+       f"⚠️ {len(rows)} تركيبة = احتمال أن يظهر رابح بالصدفة؛ لا تعتمد إلا ما كان موجباً في TEST بعد التكلفة الواقعية وأعده على فترة/عملات أخرى.","",
+       f"الأساس: {fmt_p(base['params'])}",
+       f"  TRAIN n={base['train']['n']} avg {base['train']['avg']:+}R PF {base['train']['pf']} | TEST n={base['test']['n']} avg {base['test']['avg']:+}R PF {base['test']['pf']}",
+       f"  إجمالي قبل التكلفة (TEST) {base['gross']:+}R | بتكلفة واقعية {base['test_real']['avg']:+}R PF {base['test_real']['pf']}",""]
+    if not elig: L.append("لا توجد تركيبة بعينة كافية (TRAIN≥150 وTEST≥60).")
+    for i,r in enumerate(elig[:6],1):
+        ok=r["test"]["avg"]>0 and r["test"]["pf"]>=1.1 and r["train"]["avg"]>0
+        L.append(f"{i}. {fmt_p(r['params'])}  {'✅ ثابتة' if ok else '❌ لا تصمد في TEST'}")
+        L.append(f"   TRAIN n={r['train']['n']} avg {r['train']['avg']:+}R PF {r['train']['pf']} | TEST n={r['test']['n']} avg {r['test']['avg']:+}R PF {r['test']['pf']} | واقعية {r['test_real']['avg']:+}R")
+    stable=[r for r in elig[:6] if r["test"]["avg"]>0 and r["test"]["pf"]>=1.1 and r["train"]["avg"]>0]
+    L.append("")
+    if stable:
+        p=stable[0]["params"]
+        L.append(f"المقترح (أعلى TRAIN وصامد في TEST):\n/v10set stop_tf={p['stop_tf']} stop_k={p['stop_k']:g} min_adx={p['min_adx']:g} cooldown={p['cooldown']} rr={p['rr']}")
+        L.append("بعد التطبيق أعد /bt على فترة أو عملات مختلفة قبل الاعتماد.")
+    else:
+        L.append("🔴 لا توجد تركيبة موجبة وصامدة: تعديل هذه المعاملات لا يكفي، والمشكلة في المحفز/النظام نفسه وليست في الوقف والأهداف.")
+    if errors: L+=["",f"⚠️ فشل تحميل {len(errors)} عملة: "+", ".join(list(errors)[:6])]
+    return "\n".join(L)
 
 def backtest_many(symbols, years=1.0, max_workers=1):
     """Run backtest_symbol over a list of symbols; every failure is recorded per symbol, never swallowed."""
@@ -3782,6 +3887,7 @@ def bt_report(per,tmin,tmax,label,errors=None):
            f"📥 عملات فشل تحميلها/اختبارها: {len(errors)}",
            "🧠 المحرك المُختبَر = نفس محرك الإشارات الحية: 4H نظام + 1H تأكيد + 15M محفز (فرص مؤكدة فقط).",
            "🕯️ القرار عند إغلاق شمعة 15M، الدخول عند افتتاح التالية، والإدارة بنفس trade_step الحي (TP جزئي، BE بعد TP1، Trailing بعد TP2، حد 24س).",
+           f"⚙️ المعاملات: {v10_params()}",
            f"💸 الرسوم {FEE*100:.2f}% + انزلاق {SLIP*100:.2f}% لكل جهة + تمويل تقديري {FUNDING_8H*100:.3f}%/8س. التمويل التاريخي الفعلي غير مضمّن.",
            "🧪 التقسيم TRAIN/TEST زمني لكل عملة. القواعد ثابتة غير مضبوطة على البيانات، لذا TRAIN/TEST اختبار ثبات لا اختبار تدريب."]
     if str(label).upper().startswith("TOP"):
@@ -3793,7 +3899,13 @@ def bt_report(per,tmin,tmax,label,errors=None):
         mt,me=metrics(tr),metrics(te)
         lines += ["",f"📈 TRAIN: n={mt['n']} | WR {mt['wr']}% | PF {mt['pf']} | {mt['total']:+}R | متوسط {mt['avg']:+}R",
                   f"📊 TEST : n={me['n']} | WR {me['wr']}% | PF {me['pf']} | {me['total']:+}R | متوسط {me['avg']:+}R",
-                  f"🎯 وصول TP1 في TEST: {me['tp1']}% | أقصى تراجع TEST: {me['dd']}R",""]
+                  f"🎯 وصول TP1 في TEST: {me['tp1']}% | أقصى تراجع TEST: {me['dd']}R"]
+        if te:
+            gross=float(np.mean([x["gross_R"] for x in te])); cost=float(np.mean([x["cost"] for x in te]))
+            mr=metrics(_real_cost_trades(te))
+            lines += [f"🧮 تشخيص التكلفة (TEST): قبل التكلفة {gross:+.3f}R | التكلفة المخصومة {cost:.3f}R | الصافي {me['avg']:+.3f}R",
+                      f"🧮 بتكلفة واقعية (رسوم {REAL_FEE*100:.2f}% + انزلاق {REAL_SLIP*100:.2f}% لكل جهة): متوسط {mr['avg']:+}R | PF {mr['pf']}"]
+        lines += [""]
         for g in ("A","B"):
             sub=[x for x in te if x.get("grade")==g]
             if sub:
@@ -4667,6 +4779,87 @@ async def cmd_bt(update,ctx):
 _BT_BUSY=[False]
 
 
+async def _run_opt(update,syms,years):
+    if _BT_BUSY[0]:
+        await update.message.reply_text("⏳ يوجد اختبار آخر قيد التشغيل؛ انتظر حتى ينتهي."); return
+    _BT_BUSY[0]=True
+    state={"stage":"load","done":0,"total":len(syms)}
+    wait=await update.message.reply_text(f"⏳ Optimiser v10 · {len(syms)} عملة · {years:g} سنة · {len(V10_GRID)} تركيبة\nتحميل البيانات ثم تشغيل التركيبات (قد يستغرق 15–40 دقيقة).")
+    try:
+        def work():
+            data={}; errors={}
+            for i,sym in enumerate(syms,1):
+                try: data[sym]=_bt_frames(sym,years)
+                except Exception as ex: errors[sym]=str(ex)[:100]
+                state.update(stage="load",done=i,total=len(syms))
+            if not data: return None,errors,[]
+            rows=v10_optimize(data,progress=lambda d,t:state.update(stage="run",done=d,total=t))
+            return rows,errors,list(data)
+        task=asyncio.create_task(asyncio.to_thread(work))
+        while not task.done():
+            await asyncio.sleep(30)
+            try: await wait.edit_text(f"⏳ Optimiser v10 · {'تحميل' if state['stage']=='load' else 'تشغيل التركيبات'} {state['done']}/{state['total']}")
+            except Exception: pass
+        rows,errors,loaded=task.result()
+        if not rows:
+            await wait.edit_text("⚠️ لم يُحمَّل أي بيان: "+"; ".join(f"{k}: {v}" for k,v in list(errors.items())[:3])); return
+        await wait.edit_text(opt_report(rows,loaded,years,errors)[:4000],link_preview_options=NO_PREVIEW)
+    except Exception as ex:
+        log.exception("optimiser")
+        try: await wait.edit_text(f"⚠️ {type(ex).__name__}: {str(ex)[:150]}")
+        except Exception: pass
+    finally:
+        _BT_BUSY[0]=False
+
+
+@admin_only
+async def cmd_btopt(update,ctx):
+    """/btopt [ALL|TOP12|BTC,ETH,...] [years<=3] — grid search of stop/ADX/cooldown/targets; ranks on TRAIN, verifies on TEST."""
+    arg=(ctx.args[0].upper() if ctx.args else "TOP12")
+    try: years=min(max(float(ctx.args[1]),0.1),3.0) if len(ctx.args)>1 else 1.0
+    except ValueError: years=1.0
+    if arg=="ALL": syms=list(COINS)[:20]
+    elif arg.startswith("TOP"):
+        try: n=min(max(int(arg[3:] or 12),3),20)
+        except ValueError: n=12
+        syms=list(await asyncio.to_thread(top_symbols,n))
+    else: syms=[clean_symbol(x) for x in arg.replace(" ","").split(",") if x][:20]
+    await _run_opt(update,syms,years)
+
+
+@admin_only
+async def cmd_v10show(update,ctx):
+    p=v10_params()
+    await update.message.reply_text(
+        "⚙️ معاملات v10 الحالية (حي + باك تست):\n"
+        f"• stop_tf={p['stop_tf']}  stop_k={p['stop_k']:g}  (الوقف = stop_k × ATR على هذا الإطار، بين {V10_RISK_MIN_PCT*100:.2f}% و{V10_RISK_MAX_PCT*100:.1f}%)\n"
+        f"• min_adx={p['min_adx']:g}  (أدنى ADX على 4H لقبول الفرصة)\n"
+        f"• cooldown={p['cooldown']}  (شموع 15m بعد صفقة خاسرة على نفس العملة)\n"
+        f"• rr={p['rr']}  {V10_RR_SETS[p['rr']]}\n"
+        "تغيير: /v10set stop_tf=1h stop_k=1.2 min_adx=20 cooldown=16 rr=runner\nإرجاع الافتراضي: /v10set reset")
+
+
+@admin_only
+async def cmd_v10set(update,ctx):
+    if not ctx.args:
+        await update.message.reply_text("مثال: /v10set stop_tf=1h stop_k=1.2 min_adx=20 cooldown=16 rr=runner\nأو: /v10set reset"); return
+    try:
+        if ctx.args[0].lower()=="reset": new=dict(V10_DEFAULTS)
+        else:
+            upd={}
+            for a in ctx.args:
+                k,_,v=a.partition("=")
+                if k not in V10_DEFAULTS or not v: raise ValueError(f"معامل غير معروف أو بلا قيمة: {a}")
+                upd[k]=v
+            new=_v10_clean({**v10_params(),**upd})
+    except ValueError as ex:
+        await update.message.reply_text(f"❌ {ex}"); return
+    with store.lock:
+        store.data.setdefault("settings",{})["v10_params"]=new; store.save("settings")
+    _analysis_cache.clear()
+    await update.message.reply_text("✅ حُفظت المعاملات ويعمل بها المحرك الحي و/bt فوراً.\n"
+        f"stop={new['stop_tf']}×{new['stop_k']:g} | adx≥{new['min_adx']:g} | cooldown={new['cooldown']} | rr={new['rr']}")
+
 @admin_only
 async def cmd_btdiag(update,ctx):
     """Quick diagnostic: the same v10 backtest on the 3 most liquid coins."""
@@ -5052,7 +5245,7 @@ ADMIN_CMD_MAP={
     "/cross":cmd_cross,"/predict":cmd_predict,"/whales":cmd_whales,
     "/explosions":cmd_explosions,"/pump":cmd_pump,"/bottom":cmd_bottoms,
     "/shortsradar":cmd_shorts_radar,"/alpha":cmd_alpha,"/scan":cmd_scan,
-    "/short":cmd_short,"/bt":cmd_bt,"/btv10":cmd_bt,"/bt50":cmd_bt50,"/users":cmd_users,
+    "/short":cmd_short,"/bt":cmd_bt,"/btv10":cmd_bt,"/btopt":cmd_btopt,"/v10set":cmd_v10set,"/v10show":cmd_v10show,"/bt50":cmd_bt50,"/users":cmd_users,
     "/viplist":cmd_viplist,"/stats":cmd_stats,"/history":cmd_history,
     "/dashboard":cmd_dashboard,"/testchannels":cmd_testchannels,"/delist":cmd_delist,
     "/golden":cmd_golden,"/share":cmd_share,
@@ -5808,7 +6001,7 @@ def main():
         ("menu",cmd_menu),("daily",cmd_daily),("cross",cmd_cross),("predict",cmd_predict),
         ("forcepost",cmd_forcepost),("clearsignals",cmd_clearsignals),
         ("smartcleanup",cmd_smartcleanup),("debug",cmd_debug),("health",cmd_health),("regime",cmd_regime),("smartmoney",cmd_smartmoney),("active",cmd_active),
-        ("post",cmd_post),("bt",cmd_bt),("backtest",cmd_bt),("btv10",cmd_bt),("bt50",cmd_bt50),
+        ("post",cmd_post),("bt",cmd_bt),("backtest",cmd_bt),("btv10",cmd_bt),("btopt",cmd_btopt),("v10set",cmd_v10set),("v10show",cmd_v10show),("bt50",cmd_bt50),
         ("scan",cmd_scan),("short",cmd_short),("delist",cmd_delist),("price",cmd_price),
         ("users",cmd_users),("testchannels",cmd_testchannels),("stats",cmd_stats),
         ("history",cmd_history),("dashboard",cmd_dashboard),
