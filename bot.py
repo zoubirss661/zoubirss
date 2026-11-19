@@ -87,7 +87,7 @@ RYMA_AI_DECISION_CACHE_TTL = max(300, _int("RYMA_AI_DECISION_CACHE_TTL", 21600))
 RYMA_CVD_TRADES = max(100, min(1000, _int("RYMA_CVD_TRADES", 500)))
 MAINTENANCE = _e("MAINTENANCE", "0") == "1"
 BRAND = "💎 Ryma Crypto 💎"
-BOT_VERSION = "Ryma Crypto v10 Adaptive Hybrid Engine RC5 · 2026-11-19"
+BOT_VERSION = "Ryma Crypto v10 Adaptive Hybrid Engine RC5.1 DIAG · 2026-11-19"
 # PRINCIPLE: alerts & analysis only — never places exchange orders
 CYCLE_RADAR = 900
 WHALE_MIN_USD = 500000
@@ -1968,6 +1968,12 @@ def trade_step(p,o,h,l,c,atr):
     if sum(t["hit"] for t in p["tps"])>=2:
         p["trail_on"]=True
         if atr and atr>0: p["sl"]=_tighten(s,p["sl"],p["ext"]-s*TRAIL_ATR*atr)
+    # Conservative same-candle handling: if TP1/TP2 moves the stop and that NEW
+    # stop is also inside this candle's range, assume target first then stop.
+    # OHLC cannot reveal the intrabar path; ignoring this touch would be optimistic.
+    if (s==1 and l<=p["sl"]) or (s==-1 and h>=p["sl"]):
+        kind="TRAIL" if p["trail_on"] else ("BE" if p["be"] else "SL")
+        return close_at(p,float(p["sl"]),kind,ev)
     # Bar-count stop is capped at four hours for every timeframe.
     tf_hold=max_hold_bars(p.get("tf"),p.get("max_hold"))
     if p["bars"]>=tf_hold: return close_at(p,c,"TIME",ev)
@@ -3940,8 +3946,16 @@ def _bt_frames(sym,years=1.0):
     bars={"15m":int(years*365*96)+400,"1h":int(years*365*24)+300,"4h":int(years*365*6)+300}
     minimum={"4h":210,"1h":205,"15m":100}
     frames={}; sources={}
+    # Choose one linear-Futures venue on 4H, then pin 1H and 15M to that exact venue.
+    # Live analysis rejects mixed venues; the backtest must enforce the same integrity rule.
+    pinned_source=None
     for tf in ("4h","1h","15m"):
-        rows,source=v10_futures_history(sym,tf,bars[tf])
+        rows,source=v10_futures_history(sym,tf,bars[tf],preferred_source=pinned_source)
+        source=normalize_futures_source(source)
+        if pinned_source is None:
+            pinned_source=source
+        elif source!=pinned_source:
+            raise NoData(f"{sym}: mixed Futures venues rejected ({pinned_source} vs {source} on {tf})")
         raw=_rows_to_df(rows,tf,bars[tf])
         if len(raw)<minimum[tf]: raise NoData(f"{sym}: بيانات Futures غير كافية لـ {tf} من {source} ({len(raw)}/{minimum[tf]})")
         frames[tf]=add_indicators(raw,100); sources[tf]=source
@@ -5410,6 +5424,17 @@ async def _run_bt(update,syms,label,years):
         per,a,b,errors=await asyncio.to_thread(backtest_many,syms,years,1)
         text,_=bt_report(per,a,b,label,errors)
         await wait.edit_text(text[:4000],link_preview_options=NO_PREVIEW)
+        # Export trade-level evidence so a bad aggregate can be diagnosed by symbol,
+        # timestamp, gross/net R, risk distance, costs, grade and exit type.
+        rows=[dict(x) for tr in (per or {}).values() for x in (tr or []) if isinstance(x,dict)]
+        if rows:
+            csv_bytes=pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
+            buf=io.BytesIO(csv_bytes)
+            safe_label=re.sub(r"[^A-Za-z0-9_-]+","_",str(label)).strip("_") or "ALL"
+            buf.name=f"Ryma_v10_{safe_label}_{years:g}y_trades.csv"
+            await ctx.bot.send_document(update.effective_chat.id,document=buf,filename=buf.name,
+                caption=f"سجل صفقات Backtest {BOT_VERSION} · {len(rows)} صفقة · للتحليل فقط",
+                protect_content=False,read_timeout=120,write_timeout=120,connect_timeout=30)
     finally:
         _BT_BUSY[0]=False
 
