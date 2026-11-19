@@ -1,5 +1,4 @@
- # Ryma Crypto AI Signal Bot v6
-numpy>=1.26,<3
+ numpy>=1.26,<3
 pandas>=2.1,<3
 requests>=2.31,<3
 ccxt>=4.4,<5
@@ -11,5 +10,4 @@ python-bidi>=0.4.2,<1
 scikit-learn>=1.4,<2
 joblib>=1.3,<2
 python-dotenv>=1.0.0
-
-
+aiohttp>=3.9,<4
