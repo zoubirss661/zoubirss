@@ -83,7 +83,7 @@ RYMA_AI_DECISION_CACHE_TTL = max(300, _int("RYMA_AI_DECISION_CACHE_TTL", 21600))
 RYMA_CVD_TRADES = max(100, min(1000, _int("RYMA_CVD_TRADES", 500)))
 MAINTENANCE = _e("MAINTENANCE", "0") == "1"
 BRAND = "💎 Ryma Crypto 💎"
-BOT_VERSION = "Ryma Crypto v10 Adaptive Hybrid Engine RC3 · 2026-11-19"
+BOT_VERSION = "Ryma Crypto v10 Adaptive Hybrid Engine RC4 · 2026-11-19"
 # PRINCIPLE: alerts & analysis only — never places exchange orders
 CYCLE_RADAR = 900
 WHALE_MIN_USD = 500000
@@ -1877,7 +1877,7 @@ def trade_step(p,o,h,l,c,atr):
         if atr and atr>0: p["sl"]=_tighten(s,p["sl"],p["ext"]-s*TRAIL_ATR*atr)
     # time stop counted in BARS of the trade's own timeframe (15m x 96 = 24h) - never wall-clock, so a bot
     # restart or a catch-up replay cannot close a trade at an old bar's price.
-    tf_hold={"15m":V10_MAX_HOLD_BARS,"1h":24,"4h":6,"1d":1}.get(p.get("tf"),MAX_HOLD)
+    tf_hold=p.get("max_hold") or {"15m":V10_MAX_HOLD_BARS,"1h":24,"4h":6,"1d":1}.get(p.get("tf"),MAX_HOLD)
     if p["bars"]>=tf_hold: return close_at(p,c,"TIME",ev)
     return ev
 
@@ -3849,6 +3849,490 @@ def opt_report(rows,syms,years,errors=None):
     if errors: L+=["",f"⚠️ فشل تحميل {len(errors)} عملة: "+", ".join(list(errors)[:6])]
     return "\n".join(L)
 
+# ======================= الرادارات الأربعة (Radars → Opportunities) =======================
+# المبدأ: كل رادار يقرأ شموعاً مغلقة فقط ويُخرج فرصة كاملة: دخول + وقف هيكلي + 4 أهداف + تقييم.
+# بلا نظر للمستقبل: الإشارة على إغلاق الشمعة t، والدخول عند افتتاح t+1، والقمم/القيعان لا تُرى قبل تأكيدها،
+# وفريم الفلتر الأعلى لا يُرى قبل إغلاقه. كل ما يُنشر يحمل وسم التحقق (موثّق / تجريبي / مرفوض).
+RADAR_TP_FRACS = [0.50, 0.25, 0.15, 0.10]
+RADAR_STOP_PCT = (0.15, 3.0)          # (أدنى, أقصى) وقف الخسارة كنسبة من الدخول — السقف 3% كما في البوت
+RADAR_GRADES = (("A+", 85.0), ("A", 75.0), ("B", 60.0))
+RADAR_FUNDING_8H = 0.0001             # تكلفة تمويل تقديرية لكل 8 ساعات (تُعامل كتكلفة دائماً: متحفظة)
+RADAR_VERDICT_AR = {
+    "validated": "✅ موثّق (اجتاز اختبار OOS بعد التكاليف)",
+    "experimental": "🧪 تجريبي — لم يُثبت إحصائياً بعد",
+    "rejected": "⛔ مرفوض في الباك تست"}
+RADAR_VERDICT_EN = {
+    "validated": "✅ Validated (passed out-of-sample test after costs)",
+    "experimental": "🧪 Experimental — not statistically proven yet",
+    "rejected": "⛔ Rejected in backtest"}
+RADAR_FRAME_TTL = {"15m": 50, "1h": 240, "4h": 600, "1d": 1800}
+
+RADARS = {
+    "liquidity_sweep": dict(
+        cmd="sweep", emoji="🌊", ar="رادار سحب السيولة", en="Liquidity Sweep Radar",
+        tf="15m", frames=("15m", "4h"), min_bars=400, r=(1.5, 2.5, 3.5, 5.0), hold=96, fresh=2, bt_years=0.5,
+        p=dict(htf="4h", htf_ema=50, atr_n=14, pl=3, pr=3, k=3, max_age=96,
+               min_depth=0.10, min_pos=0.60, buf=0.10)),
+    "fvg": dict(
+        cmd="fvg", emoji="🧩", ar="رادار فجوات القيمة العادلة", en="Fair Value Gap Radar",
+        tf="15m", frames=("15m", "1h"), min_bars=300, r=(1.5, 2.5, 3.5, 5.0), hold=48, fresh=2, bt_years=0.5,
+        p=dict(htf="1h", htf_ema=50, atr_n=14, disp=1.0, gmin=0.20, gmax=3.00, max_age=32, buf=0.20)),
+    "hourly_momentum": dict(
+        cmd="momentum", emoji="🚀", ar="رادار زخم الساعة", en="Hourly Momentum Radar",
+        tf="1h", frames=("1h",), min_bars=260, r=(1.5, 2.5, 3.5, 5.0), hold=24, fresh=1, bt_years=2.0,
+        p=dict(move=3.0, vol_win=24, vol_mult=1.5, loc=0.70, atr_n=14, sl_atr=1.5, shorts=True)),
+    "bollinger_pctb_short": dict(
+        cmd="bbshort", emoji="🔻", ar="رادار بولينجر %B (بيع)", en="Bollinger %B Short Radar",
+        tf="4h", frames=("4h",), min_bars=120, r=(1.0, 2.0, 3.0, 4.0), hold=12, fresh=1, bt_years=3.0,
+        p=dict(n=20, k=2.0, rsi_n=14, rsi_min=65.0, pb_hi=1.0, atr_n=14, buf=0.25)),
+}
+RADAR_BY_CMD = {v["cmd"]: k for k, v in RADARS.items()}
+
+
+def radar_label(name, lang="ar"):
+    s = RADARS[name]
+    return f"{s['emoji']} {s['ar'] if lang != 'en' else s['en']}"
+
+
+# ----------------------------------------------------------------- مؤشرات سببية
+def _r_frame(df):
+    """شموع البوت (عمود t بالملي ثانية) -> إطار مفهرس بزمن فتح الشمعة (UTC)."""
+    out = df[["open", "high", "low", "close", "volume"]].astype(float).copy()
+    out.index = pd.DatetimeIndex(pd.to_datetime(df["t"].to_numpy(dtype="int64"), unit="ms", utc=True))
+    return out
+
+
+def _r_atr(d, n=14):
+    pc = d["close"].shift(1)
+    tr = pd.concat([d["high"] - d["low"], (d["high"] - pc).abs(), (d["low"] - pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+
+
+def _r_ema(s, n):
+    return s.ewm(span=n, adjust=False, min_periods=n).mean()
+
+
+def _r_rsi(c, n=14):
+    dl = c.diff()
+    up, dn = dl.clip(lower=0.0), -dl.clip(upper=0.0)
+    au = up.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+    ad = dn.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+    out = 100.0 - 100.0 / (1.0 + au / ad)
+    out = out.mask((ad == 0) & (au > 0), 100.0)
+    return out.mask((ad == 0) & (au == 0), 50.0)
+
+
+def _r_bb(c, n=20, k=2.0):
+    mid = c.rolling(n, min_periods=n).mean()
+    sd = c.rolling(n, min_periods=n).std(ddof=0)
+    up, lo = mid + k * sd, mid - k * sd
+    w = up - lo
+    return pd.DataFrame({"mid": mid, "up": up, "lo": lo, "pb": (c - lo) / w.where(w > 0)})
+
+
+def _r_pivots(d, left, right, k, max_age):
+    """آخر k قيعان/قمم محورية *مؤكدة* (الأحدث أولاً) كما تُرى عند إغلاق كل شمعة.
+    القمة عند p لا تظهر إلا من الشمعة p+right (لا نظر للمستقبل). الأعمدة lo1..lok و hi1..hik."""
+    h, l = d["high"].to_numpy(float), d["low"].to_numpy(float)
+    n = len(d)
+    lo_hist, hi_hist = [], []
+    out_lo, out_hi = np.full((n, k), np.nan), np.full((n, k), np.nan)
+    for t in range(n):
+        p = t - right
+        if p >= left:
+            if l[p] == l[p - left:p + right + 1].min() and l[p] < l[p - left:p].min():
+                lo_hist.append((p, l[p]))
+            if h[p] == h[p - left:p + right + 1].max() and h[p] > h[p - left:p].max():
+                hi_hist.append((p, h[p]))
+            del lo_hist[:-64], hi_hist[:-64]
+        for hist, out in ((lo_hist, out_lo), (hi_hist, out_hi)):
+            j = 0
+            for idx, lvl in reversed(hist):
+                if t - idx > max_age or j >= k:
+                    break
+                out[t, j] = lvl
+                j += 1
+    cols = {f"lo{j + 1}": out_lo[:, j] for j in range(k)}
+    cols.update({f"hi{j + 1}": out_hi[:, j] for j in range(k)})
+    return pd.DataFrame(cols, index=d.index)
+
+
+def _r_align(base_idx, base_tf, htf_feat, htf_tf):
+    """يُسقط ميزات الفريم الأعلى على شموع الفريم الأساسي بدون نظر للمستقبل:
+    صف الفريم الأعلى لا يُرى إلا بعد إغلاقه (فتح + مدته)."""
+    h = htf_feat.copy()
+    h.index = h.index + pd.Timedelta(milliseconds=TF_MS[htf_tf])
+    target = base_idx + pd.Timedelta(milliseconds=TF_MS[base_tf])
+    out = h.reindex(target, method="ffill")
+    out.index = base_idx
+    return out
+
+
+def _r_resample(df, tf):
+    """يبني فريماً أعلى من شموع أدق (للباك تست). الشموع غير المكتملة تُحذف."""
+    tfms = TF_MS[tf]
+    step = int(np.median(np.diff(df["t"].to_numpy(dtype="int64")[-200:])))
+    need = max(tfms // max(step, 1), 1)
+    b = (df["t"].astype("int64") // tfms) * tfms
+    g = df.groupby(b, sort=True)
+    out = g.agg(open=("open", "first"), high=("high", "max"), low=("low", "min"),
+                close=("close", "last"), volume=("volume", "sum"), n=("t", "count"))
+    out = out[out["n"] >= need].drop(columns="n")
+    out.insert(0, "t", out.index.astype("int64"))
+    return out.reset_index(drop=True)
+
+
+def _r_finish(d, side, stop, score, reason, info, atr):
+    """يوحّد مخرجات الرادارات ويُسقط الإشارات ذات المخاطرة خارج الحدود (قبل الدخول الفعلي)."""
+    c = d["close"]
+    side = pd.Series(side, index=d.index).astype(float).fillna(0.0)
+    pct = (c - stop).abs() / c * 100.0
+    ok = (((side > 0) & (stop < c)) | ((side < 0) & (stop > c))) & pct.between(*RADAR_STOP_PCT)
+    return pd.DataFrame({"side": side.where(ok, 0.0).astype(int), "stop": stop,
+                         "score": score.clip(0, 100).round(1), "reason": reason,
+                         "info": info, "atr": atr}, index=d.index)
+
+
+def _r_info(d, mask, fn):
+    out = pd.Series([None] * len(d), index=d.index, dtype=object)
+    for ts in d.index[np.asarray(mask)]:
+        out[ts] = fn(ts)
+    return out
+
+
+# ----------------------------------------------------------------- 1) سحب السيولة
+def _radar_sweep(d, aux, p, tf):
+    a = _r_atr(d, p["atr_n"])
+    piv = _r_pivots(d, p["pl"], p["pr"], p["k"], p["max_age"])
+    htf = aux[p["htf"]]
+    feat = pd.DataFrame({"c": htf["close"], "e": _r_ema(htf["close"], p["htf_ema"])})
+    al = _r_align(d.index, tf, feat, p["htf"])
+    up, dn = al["c"] > al["e"], al["c"] < al["e"]
+    o, h, l, c = d["open"], d["high"], d["low"], d["close"]
+    rng = (h - l).where(h > l)
+    lo_l = pd.Series(np.nan, index=d.index)
+    hi_l = pd.Series(np.nan, index=d.index)
+    for j in range(1, p["k"] + 1):
+        lv, hv = piv[f"lo{j}"], piv[f"hi{j}"]
+        lo_l = lo_l.where(lo_l.notna(), lv.where((l < lv) & (c > lv)))
+        hi_l = hi_l.where(hi_l.notna(), hv.where((h > hv) & (c < hv)))
+    dep_l, dep_s = (lo_l - l) / a, (h - hi_l) / a
+    pos_l, pos_s = (c - l) / rng, (h - c) / rng
+    long_m = lo_l.notna() & up & (dep_l >= p["min_depth"]) & (pos_l >= p["min_pos"])
+    short_m = hi_l.notna() & dn & (dep_s >= p["min_depth"]) & (pos_s >= p["min_pos"]) & ~long_m
+    side = pd.Series(0, index=d.index)
+    side[long_m], side[short_m] = 1, -1
+    stop = pd.Series(np.nan, index=d.index)
+    stop[long_m] = (l - p["buf"] * a)[long_m]
+    stop[short_m] = (h + p["buf"] * a)[short_m]
+    dep = dep_l.where(long_m, dep_s).fillna(0.0)
+    pos = pos_l.where(long_m, pos_s).fillna(0.0)
+    score = 50.0 + 15.0 * dep.clip(0, 2) + 25.0 * ((pos - p["min_pos"]) / (1 - p["min_pos"])).clip(0, 1)
+    reason = pd.Series(np.where(long_m, f"سحب سيولة تحت قاع محوري ثم إغلاق داخله · 4س فوق EMA{p['htf_ema']}",
+                       np.where(short_m, f"سحب سيولة فوق قمة محورية ثم رفض · 4س تحت EMA{p['htf_ema']}", "")),
+                       index=d.index, dtype=object)
+    info = _r_info(d, long_m | short_m, lambda ts: dict(
+        kind="low" if long_m[ts] else "high", level=float(lo_l[ts] if long_m[ts] else hi_l[ts])))
+    sig = _r_finish(d, side, stop, score, reason, info, a)
+    t_up, t_dn = bool(up.iloc[-1]), bool(dn.iloc[-1])
+    sig.attrs["diag"] = ["فلتر 4س: " + ("صاعد (يسمح بالشراء)" if t_up else ("هابط (يسمح بالبيع)" if t_dn else "غير متاح")),
+                         "لا سحب سيولة مؤكد على آخر شمعة"]
+    return sig
+
+
+# ----------------------------------------------------------------- 2) فجوة القيمة العادلة
+def _radar_fvg(d, aux, p, tf):
+    n = len(d)
+    a = _r_atr(d, p["atr_n"])
+    av = a.to_numpy()
+    o, h, l, c = (d[k].to_numpy(float) for k in ("open", "high", "low", "close"))
+    htf = aux[p["htf"]]
+    feat = pd.DataFrame({"c": htf["close"], "e": _r_ema(htf["close"], p["htf_ema"])})
+    al = _r_align(d.index, tf, feat, p["htf"])
+    up, dn = (al["c"] > al["e"]).to_numpy(), (al["c"] < al["e"]).to_numpy()
+    side, stop, score = np.zeros(n, int), np.full(n, np.nan), np.zeros(n)
+    reason = np.full(n, "", dtype=object)
+    infos = {}
+    gaps = []  # [born, side, bottom, top]
+    for t in range(2, n):
+        at = av[t]
+        if not np.isfinite(at) or at <= 0:
+            continue
+        alive, fired = [], None
+        for g in gaps:
+            born, gs, bot, top = g
+            if t - born > p["max_age"]:
+                continue
+            if gs == 1:
+                if c[t] < bot:
+                    continue
+                if fired is None and l[t] <= top and c[t] > o[t] and c[t] > bot and up[t]:
+                    fired = g
+                    continue
+            else:
+                if c[t] > top:
+                    continue
+                if fired is None and h[t] >= bot and c[t] < o[t] and c[t] < top and dn[t]:
+                    fired = g
+                    continue
+            alive.append(g)
+        gaps = alive
+        if fired is not None:
+            born, gs, bot, top = fired
+            side[t] = gs
+            size = (top - bot) / at
+            if gs == 1:
+                stop[t] = min(bot, l[t]) - p["buf"] * at
+                reason[t] = "إعادة اختبار فجوة صاعدة + شمعة إغلاق صاعدة · 1س فوق EMA%d" % p["htf_ema"]
+            else:
+                stop[t] = max(top, h[t]) + p["buf"] * at
+                reason[t] = "إعادة اختبار فجوة هابطة + شمعة إغلاق هابطة · 1س تحت EMA%d" % p["htf_ema"]
+            score[t] = 60.0 + 15.0 * min(size, 2.0) + 10.0
+            infos[t] = dict(bot=float(bot), top=float(top), born_t=int(d.index[born].value // 10**6))
+        if np.isfinite(av[t - 1]) and abs(c[t - 1] - o[t - 1]) >= p["disp"] * av[t - 1]:
+            if l[t] > h[t - 2] and c[t - 1] > o[t - 1]:
+                gs_ = (l[t] - h[t - 2]) / at
+                if p["gmin"] <= gs_ <= p["gmax"]:
+                    gaps.append([t, 1, h[t - 2], l[t]])
+            elif h[t] < l[t - 2] and c[t - 1] < o[t - 1]:
+                gs_ = (l[t - 2] - h[t]) / at
+                if p["gmin"] <= gs_ <= p["gmax"]:
+                    gaps.append([t, -1, h[t], l[t - 2]])
+    idx = d.index
+    info = pd.Series([infos.get(i) for i in range(n)], index=idx, dtype=object)
+    sig = _r_finish(d, pd.Series(side, index=idx), pd.Series(stop, index=idx), pd.Series(score, index=idx),
+                    pd.Series(reason, index=idx, dtype=object), info, a)
+    sig.attrs["diag"] = ["فلتر 1س: " + ("صاعد" if up[-1] else ("هابط" if dn[-1] else "غير متاح")),
+                         f"فجوات نشطة بانتظار إعادة الاختبار: {len(gaps)}"]
+    return sig
+
+
+# ----------------------------------------------------------------- 3) زخم الساعة
+def _radar_momentum(d, aux, p, tf):
+    o, h, l, c, v = (d[k] for k in ("open", "high", "low", "close", "volume"))
+    a = _r_atr(d, p["atr_n"])
+    ret = (c / c.shift(1) - 1.0) * 100.0
+    va = v.rolling(p["vol_win"], min_periods=p["vol_win"]).mean().shift(1)
+    vr = v / va.where(va > 0)
+    rng = (h - l).where(h > l)
+    pu, pdn = (c - l) / rng, (h - c) / rng
+    long_m = (ret >= p["move"]) & (vr >= p["vol_mult"]) & (pu >= p["loc"])
+    short_m = (ret <= -p["move"]) & (vr >= p["vol_mult"]) & (pdn >= p["loc"])
+    if not p["shorts"]:
+        short_m = short_m & False
+    side = pd.Series(0, index=d.index)
+    side[long_m], side[short_m] = 1, -1
+    stop = pd.Series(np.nan, index=d.index)
+    stop[long_m] = (c - p["sl_atr"] * a)[long_m]
+    stop[short_m] = (c + p["sl_atr"] * a)[short_m]
+    score = 45.0 + 10.0 * (ret.abs() / p["move"]).clip(0, 3) + 8.0 * (vr.fillna(0) / p["vol_mult"]).clip(0, 3)
+    reason = pd.Series(np.where(long_m, f"شمعة ساعة ≥ +{p['move']:g}% مع فوليوم ≥ {p['vol_mult']:g}× وإغلاق قوي",
+                       np.where(short_m, f"شمعة ساعة ≤ -{p['move']:g}% مع فوليوم ≥ {p['vol_mult']:g}× وإغلاق ضعيف", "")),
+                       index=d.index, dtype=object)
+    info = _r_info(d, long_m | short_m, lambda ts: dict(move=float(ret[ts]), vol_ratio=float(vr[ts])))
+    sig = _r_finish(d, side, stop, score, reason, info, a)
+    lr, lv_ = float(ret.iloc[-1]) if np.isfinite(ret.iloc[-1]) else 0.0, float(vr.iloc[-1]) if np.isfinite(vr.iloc[-1]) else 0.0
+    sig.attrs["diag"] = [f"آخر شمعة ساعة: {lr:+.2f}% (الحد ±{p['move']:g}%)", f"الفوليوم: ×{lv_:.1f} (الحد ×{p['vol_mult']:g})"]
+    return sig
+
+
+# ----------------------------------------------------------------- 4) بولينجر %B بيع
+def _radar_bbshort(d, aux, p, tf):
+    o, h, c = d["open"], d["high"], d["close"]
+    bb = _r_bb(c, p["n"], p["k"])
+    pb = bb["pb"]
+    a = _r_atr(d, p["atr_n"])
+    r = _r_rsi(c, p["rsi_n"])
+    short_m = (pb.shift(1) >= p["pb_hi"]) & (pb < p["pb_hi"]) & (c < o) & (r.shift(1) >= p["rsi_min"])
+    side = pd.Series(0, index=d.index)
+    side[short_m] = -1
+    stop = pd.Series(np.nan, index=d.index)
+    stop[short_m] = (pd.concat([h, h.shift(1)], axis=1).max(axis=1) + p["buf"] * a)[short_m]
+    score = 50.0 + (pb.shift(1) - p["pb_hi"]).clip(0, 0.5) * 40.0 + (r.shift(1) - p["rsi_min"]).clip(0, 20)
+    reason = pd.Series(np.where(short_m, "إغلاق سابق فوق باند بولينجر العلوي + RSI مرتفع ثم شمعة رفض هابطة", ""),
+                       index=d.index, dtype=object)
+    info = _r_info(d, short_m, lambda ts: dict(pb_prev=float(pb.shift(1)[ts]), rsi_prev=float(r.shift(1)[ts])))
+    sig = _r_finish(d, side, stop, score, reason, info, a)
+    lp = float(pb.iloc[-1]) if np.isfinite(pb.iloc[-1]) else 0.0
+    lr = float(r.iloc[-1]) if np.isfinite(r.iloc[-1]) else 50.0
+    sig.attrs["diag"] = [f"%B الحالي = {lp:.2f} (يلزم إغلاق ≥ {p['pb_hi']:g} ثم رفض)", f"RSI = {lr:.0f} (يلزم ≥ {p['rsi_min']:g} قبل الرفض)"]
+    return sig
+
+
+_RADAR_FN = {"liquidity_sweep": _radar_sweep, "fvg": _radar_fvg,
+             "hourly_momentum": _radar_momentum, "bollinger_pctb_short": _radar_bbshort}
+
+
+def radar_signals(name, frames):
+    """frames = {tf: شموع البوت}. يرجع إطار إشارات (side/stop/score/reason/info/atr + t بالملي ثانية)
+    على شموع الفريم الأساسي للرادار، أو None إذا البيانات غير كافية."""
+    spec = RADARS[name]
+    base = frames.get(spec["tf"])
+    if base is None or len(base) < spec["min_bars"]:
+        return None
+    for tf in spec["frames"]:
+        if tf != spec["tf"] and (frames.get(tf) is None or len(frames[tf]) < 60):
+            return None
+    d = _r_frame(base)
+    aux = {tf: _r_frame(frames[tf]) for tf in spec["frames"] if tf != spec["tf"]}
+    sig = _RADAR_FN[name](d, aux, spec["p"], spec["tf"])
+    sig["t"] = base["t"].to_numpy(dtype="int64")
+    return sig
+
+
+# ----------------------------------------------------------------- مستويات الصفقة
+def radar_grade(score):
+    for g, th in RADAR_GRADES:
+        if score >= th:
+            return g
+    return "C"
+
+
+def radar_levels(side, entry, stop, atr, r_mults):
+    """مستويات الفرصة بصيغة البوت (4 أهداف بنسب 50/25/15/10). None إن كانت المخاطرة خارج الحدود."""
+    risk = side * (entry - stop)
+    if not (entry > 0 and risk > 0):
+        return None
+    if not (RADAR_STOP_PCT[0] <= risk / entry * 100.0 <= RADAR_STOP_PCT[1]):
+        return None
+    tps = []
+    for k, m in enumerate(r_mults):
+        px = entry + side * risk * m
+        tps.append(dict(px=float(px), pct=round(100 * side * (px - entry) / entry, 2),
+                        frac=RADAR_TP_FRACS[k], hit=False, src="R"))
+    return dict(entry=float(entry), sl=float(stop), risk=float(risk), tps=tps, atr=float(atr or 0.0))
+
+
+def radar_eval(name, frames, price=None):
+    """يقيّم رادارًا واحدًا على آخر شمعة مغلقة.
+    يرجع (opp, diag): opp = dict جاهز للنشر/التتبع، أو None مع diag = أسطر تشرح الحالة."""
+    spec = RADARS[name]
+    sig = radar_signals(name, frames)
+    if sig is None:
+        return None, ["بيانات غير كافية لهذا الرادار"]
+    n = len(sig)
+    lo = max(0, n - spec["fresh"])
+    rows = sig.iloc[lo:]
+    hit = rows[rows["side"] != 0]
+    diag = list(sig.attrs.get("diag", []))
+    if hit.empty:
+        return None, diag
+    row = hit.iloc[-1]
+    side = int(row["side"])
+    pos = sig.index.get_loc(hit.index[-1])
+    ref = float(frames[spec["tf"]]["close"].iloc[pos])          # سعر إغلاق شمعة الإشارة
+    entry = float(price) if price else float(frames[spec["tf"]]["close"].iloc[-1])
+    stop = float(row["stop"])
+    # لا مطاردة: إن ابتعد السعر أكثر من نصف المخاطرة عن نقطة الإشارة فالفرصة انتهت
+    if side * (entry - ref) > 0.5 * abs(ref - stop):
+        return None, diag + ["إشارة منتهية: السعر ابتعد أكثر من نصف المخاطرة عن نقطة الإشارة (لا مطاردة)"]
+    lv = radar_levels(side, entry, stop, float(row["atr"]), spec["r"])
+    if lv is None:
+        return None, diag + ["إشارة ملغاة: السعر الحالي جعل المخاطرة خارج الحدود (0.15%–3%) أو تجاوز الوقف"]
+    score = float(row["score"])
+    opp = dict(radar=name, side=side, tf=spec["tf"], score=score, grade=radar_grade(score),
+               reasons=[x for x in str(row["reason"]).split(" · ") if x], lv=lv,
+               bar_t=int(row["t"]), info=row["info"] if isinstance(row["info"], dict) else {},
+               max_hold=spec["hold"], age_bars=int(n - 1 - sig.index.get_loc(hit.index[-1])))
+    return opp, diag
+
+
+# ======================================================================================================================
+# Strategy lab: backtest-only. These radars are NOT wired to live publishing until /btx proves them on real data.
+# ======================================================================================================================
+def radar_replay(name, frames, max_hold=None):
+    """Replay one radar strategy: signals are causal (verified), entry = open of the NEXT candle of the radar's own
+    timeframe, management = the SAME trade_step as live (partial TPs 50/25/15/10, BE after TP1, trailing after TP2,
+    per-radar bar limit), cost = trade_cost_r (fees + slippage + funding estimate). One open trade per symbol.
+    Returns (trades, data_start_ms, data_end_ms)."""
+    spec = RADARS[name]; tf = spec["tf"]
+    sig = radar_signals(name, frames)
+    if sig is None: return [], 0, 0
+    base = frames[tf]
+    t = base["t"].to_numpy(dtype="int64"); o = base["open"].to_numpy(float); h = base["high"].to_numpy(float)
+    l = base["low"].to_numpy(float); c = base["close"].to_numpy(float)
+    atr_arr = sig["atr"].to_numpy(float)
+    side_arr = sig["side"].to_numpy(int); stop_arr = sig["stop"].to_numpy(float); score_arr = sig["score"].to_numpy(float)
+    hold = int(max_hold or spec["hold"]); step_ms = TF_MS[tf]
+    data_start, data_end = int(t[min(len(t) - 1, spec["min_bars"])]), int(t[-1])
+    trades = []; next_ok = 0
+    for j in range(spec["min_bars"], len(t) - 1):
+        s = int(side_arr[j])
+        if s == 0 or t[j] < next_ok: continue
+        fill = float(o[j + 1]); stop = float(stop_arr[j]); ref = float(c[j])
+        if s * (fill - ref) > 0.5 * abs(ref - stop): continue          # same no-chase rule as radar_eval
+        lv = radar_levels(s, fill, stop, atr_arr[j], spec["r"])
+        if lv is None: continue
+        p = new_trade(name, tf, s, lv, int(t[j]), radar_grade(float(score_arr[j])), name)
+        p["max_hold"] = hold
+        k = j + 1
+        while k < len(t) and p["state"] in ("pending", "open"):
+            trade_step(p, o[k], h[k], l[k], c[k], atr_arr[k] if np.isfinite(atr_arr[k]) else 0.0); k += 1
+        if p["state"] != "closed": break
+        gross = round(p["realized"], 4)
+        trades.append(dict(coin=name, sym=None, t=int(t[j + 1]), signal_t=int(t[j]) + step_ms, R=p["R"], gross_R=gross,
+            exit=p["result"], bars=p["bars"], tps=sum(1 for x in p["tps"] if x["hit"]), cost=round(gross - p["R"], 4),
+            grade=p["grade"], score=float(score_arr[j]), side=s, setup=name, strategy=name,
+            risk_pct=round(100 * lv["risk"] / fill, 4), hours=p["bars"] * step_ms / 3_600_000, entry=fill,
+            data_start=data_start, data_end=data_end))
+        next_ok = int(t[k - 1]) + step_ms
+    return trades, data_start, data_end
+
+
+def _lab_frames(sym, name, years):
+    spec = RADARS[name]; years = min(max(float(years), 0.1), 3.0)
+    per_year = {"15m": 365 * 96, "1h": 365 * 24, "4h": 365 * 6}
+    out = {}
+    for tf in spec["frames"]:
+        n = int(years * per_year[tf]) + 400
+        rows, _ = v10_futures_history(sym, tf, n)
+        raw = _rows_to_df(rows, tf, n)
+        if len(raw) < 100: raise NoData(f"{sym}: بيانات {tf} غير كافية ({len(raw)})")
+        out[tf] = raw
+    return out
+
+
+def lab_many(symbols, name, years=None):
+    """Backtest one radar over many symbols; returns (per, tmin, tmax, errors) like backtest_many."""
+    years = years or RADARS[name]["bt_years"]
+    per, errors, tmin, tmax = {}, {}, None, None
+    for sym in dict.fromkeys(symbols):
+        try:
+            trs, a, b = radar_replay(name, _lab_frames(sym, name, years))
+            for x in trs: x["sym"] = sym; x["coin"] = sym
+            per[sym] = trs
+            if a: tmin = a if tmin is None else min(tmin, a); tmax = b if tmax is None else max(tmax, b)
+        except Exception as ex:
+            errors[sym] = f"{type(ex).__name__}: {str(ex)[:100]}"
+    return per, tmin, tmax, errors
+
+
+def lab_report(name, per, tmin, tmax, errors=None, years=None):
+    spec = RADARS[name]; errors = errors or {}
+    allt = [x for tr in per.values() for x in tr]
+    L = [f"🧪 Strategy Lab · {radar_label(name)} · {len(per)} عملة · {years or spec['bt_years']:g} سنة · {BOT_VERSION}",
+         f"الإطار {spec['tf']} | أهداف R={spec['r']} | حد {spec['hold']} شمعة | دخول عند افتتاح الشمعة التالية | إدارة = trade_step الحي",
+         f"💸 رسوم {FEE*100:.2f}% + انزلاق {SLIP*100:.2f}% لكل جهة + تمويل تقديري. التقسيم TRAIN/TEST زمني لكل عملة."]
+    if not allt:
+        L += ["", "⚠️ لا صفقات في الفترة — لا حكم."]
+    else:
+        tr, te = split_trades_by_symbol(allt, tmin, tmax, 0.65)
+        mt, me = metrics(tr), metrics(te)
+        L += ["", f"TRAIN: n={mt['n']} | WR {mt['wr']}% | PF {mt['pf']} | {mt['total']:+}R | متوسط {mt['avg']:+}R",
+              f"TEST : n={me['n']} | WR {me['wr']}% | PF {me['pf']} | {me['total']:+}R | متوسط {me['avg']:+}R | أقصى تراجع {me['dd']}R"]
+        if te:
+            mr = metrics(_real_cost_trades(te))
+            L.append(f"🧮 قبل التكلفة {np.mean([x['gross_R'] for x in te]):+.3f}R | التكلفة {np.mean([x['cost'] for x in te]):.3f}R | "
+                     f"بتكلفة واقعية {mr['avg']:+}R PF {mr['pf']}")
+            for side, nm in ((1, "BUY"), (-1, "SELL")):
+                sub = [x for x in te if x["side"] == side]
+                if sub:
+                    m = metrics(sub); L.append(f"{nm}: n={m['n']} · WR {m['wr']}% · PF {m['pf']} · {m['total']:+}R")
+        L += ["", f"الحكم: {bt_verdict(mt, me)}"]
+    if errors:
+        L += ["", f"⚠️ فشل {len(errors)} عملة: " + " | ".join(f"{k}: {v[:60]}" for k, v in list(errors.items())[:3])]
+    return "\n".join(L)
+
 def backtest_many(symbols, years=1.0, max_workers=1):
     """Run backtest_symbol over a list of symbols; every failure is recorded per symbol, never swallowed."""
     per,tmin,tmax,errors={},None,None,{}
@@ -4860,6 +5344,49 @@ async def cmd_v10set(update,ctx):
     await update.message.reply_text("✅ حُفظت المعاملات ويعمل بها المحرك الحي و/bt فوراً.\n"
         f"stop={new['stop_tf']}×{new['stop_k']:g} | adx≥{new['min_adx']:g} | cooldown={new['cooldown']} | rr={new['rr']}")
 
+
+@admin_only
+async def cmd_btx(update, ctx):
+    """/btx [sweep|fvg|momentum|bbshort|all] [ALL|TOP12|BTC,ETH,...] [years] — backtest the 4 radar strategies, one engine/report."""
+    arg = (ctx.args[0].lower() if ctx.args else "all")
+    names = list(RADARS) if arg == "all" else ([RADAR_BY_CMD[arg]] if arg in RADAR_BY_CMD else None)
+    if not names:
+        await update.message.reply_text("الاستعمال: /btx sweep|fvg|momentum|bbshort|all [TOP12|ALL|BTC,ETH] [years]"); return
+    sel = (ctx.args[1].upper() if len(ctx.args) > 1 else "TOP12")
+    try: years = min(max(float(ctx.args[2]), 0.1), 3.0) if len(ctx.args) > 2 else None
+    except ValueError: years = None
+    if sel == "ALL": syms = list(COINS)[:20]
+    elif sel.startswith("TOP"):
+        try: n = min(max(int(sel[3:] or 12), 3), 20)
+        except ValueError: n = 12
+        syms = list(await asyncio.to_thread(top_symbols, n))
+    else: syms = [clean_symbol(x) for x in sel.replace(" ", "").split(",") if x][:20]
+    if _BT_BUSY[0]:
+        await update.message.reply_text("⏳ يوجد اختبار آخر قيد التشغيل؛ انتظر حتى ينتهي."); return
+    _BT_BUSY[0] = True
+    wait = await update.message.reply_text(f"⏳ Strategy Lab · {len(names)} استراتيجية × {len(syms)} عملة — تحميل البيانات قد يستغرق عدة دقائق.")
+    try:
+        summary = []
+        for nm in names:
+            per, a, b, errors = await asyncio.to_thread(lab_many, syms, nm, years)
+            text = lab_report(nm, per, a, b, errors, years)
+            allt = [x for tr in per.values() for x in tr]
+            tr, te = split_trades_by_symbol(allt, a, b, 0.65) if allt else ([], [])
+            m = metrics(te); summary.append(f"{radar_label(nm)}: TEST n={m['n']} avg {m['avg']:+}R PF {m['pf']}")
+            if len(names) == 1: await wait.edit_text(text[:4000], link_preview_options=NO_PREVIEW)
+            else:
+                await update.message.reply_text(text[:4000], link_preview_options=NO_PREVIEW)
+                try: await wait.edit_text(f"⏳ اكتملت {len(summary)}/{len(names)}")
+                except Exception: pass
+        if len(names) > 1:
+            await wait.edit_text("📋 ملخص المقارنة (TEST):\n" + "\n".join(summary))
+    except Exception as ex:
+        log.exception("btx")
+        try: await wait.edit_text(f"⚠️ {type(ex).__name__}: {str(ex)[:150]}")
+        except Exception: pass
+    finally:
+        _BT_BUSY[0] = False
+
 @admin_only
 async def cmd_btdiag(update,ctx):
     """Quick diagnostic: the same v10 backtest on the 3 most liquid coins."""
@@ -5245,7 +5772,7 @@ ADMIN_CMD_MAP={
     "/cross":cmd_cross,"/predict":cmd_predict,"/whales":cmd_whales,
     "/explosions":cmd_explosions,"/pump":cmd_pump,"/bottom":cmd_bottoms,
     "/shortsradar":cmd_shorts_radar,"/alpha":cmd_alpha,"/scan":cmd_scan,
-    "/short":cmd_short,"/bt":cmd_bt,"/btv10":cmd_bt,"/btopt":cmd_btopt,"/v10set":cmd_v10set,"/v10show":cmd_v10show,"/bt50":cmd_bt50,"/users":cmd_users,
+    "/short":cmd_short,"/bt":cmd_bt,"/btv10":cmd_bt,"/btx":cmd_btx,"/btopt":cmd_btopt,"/v10set":cmd_v10set,"/v10show":cmd_v10show,"/bt50":cmd_bt50,"/users":cmd_users,
     "/viplist":cmd_viplist,"/stats":cmd_stats,"/history":cmd_history,
     "/dashboard":cmd_dashboard,"/testchannels":cmd_testchannels,"/delist":cmd_delist,
     "/golden":cmd_golden,"/share":cmd_share,
@@ -6001,7 +6528,7 @@ def main():
         ("menu",cmd_menu),("daily",cmd_daily),("cross",cmd_cross),("predict",cmd_predict),
         ("forcepost",cmd_forcepost),("clearsignals",cmd_clearsignals),
         ("smartcleanup",cmd_smartcleanup),("debug",cmd_debug),("health",cmd_health),("regime",cmd_regime),("smartmoney",cmd_smartmoney),("active",cmd_active),
-        ("post",cmd_post),("bt",cmd_bt),("backtest",cmd_bt),("btv10",cmd_bt),("btopt",cmd_btopt),("v10set",cmd_v10set),("v10show",cmd_v10show),("bt50",cmd_bt50),
+        ("post",cmd_post),("bt",cmd_bt),("backtest",cmd_bt),("btv10",cmd_bt),("btx",cmd_btx),("btopt",cmd_btopt),("v10set",cmd_v10set),("v10show",cmd_v10show),("bt50",cmd_bt50),
         ("scan",cmd_scan),("short",cmd_short),("delist",cmd_delist),("price",cmd_price),
         ("users",cmd_users),("testchannels",cmd_testchannels),("stats",cmd_stats),
         ("history",cmd_history),("dashboard",cmd_dashboard),
