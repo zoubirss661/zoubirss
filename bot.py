@@ -1,4 +1,4 @@
-import os, io, re, json, time, asyncio, logging, threading, functools, hashlib
+import os, io, re, json, time, asyncio, logging, threading, functools, hashlib, hmac
 import datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np, pandas as pd, requests, ccxt, matplotlib
@@ -87,7 +87,7 @@ RYMA_AI_DECISION_CACHE_TTL = max(300, _int("RYMA_AI_DECISION_CACHE_TTL", 21600))
 RYMA_CVD_TRADES = max(100, min(1000, _int("RYMA_CVD_TRADES", 500)))
 MAINTENANCE = _e("MAINTENANCE", "0") == "1"
 BRAND = "💎 Ryma Crypto 💎"
-BOT_VERSION = "Ryma Crypto v10 Adaptive Hybrid Engine RC5.1 DIAG · 2026-11-19"
+BOT_VERSION = "Ryma Crypto v10 Adaptive Hybrid Engine RC7.0 · 2026-11-20"
 # PRINCIPLE: alerts & analysis only — never places exchange orders
 CYCLE_RADAR = 900
 WHALE_MIN_USD = 500000
@@ -163,7 +163,7 @@ def referral_for(source):
 
 def display_source(src):
     s = (src or "binance_fut").lower()
-    if s in ("binance_fut","binance_usdm"): return "BINANCE FUTURES"
+    if s in ("binance","binance_fut","binance_usdm"): return "BINANCE FUTURES"
     if s == "binance_spot_mirror": return "BINANCE SPOT (DEGRADED)"
     if s.endswith("_linear_swap"): return f"{s.split('_',1)[0].upper()} USDT-M FUTURES"
     if "future" in s or "swap" in s or "perp" in s: return s.upper()
@@ -210,16 +210,22 @@ VIP_POSTS_PER_CYCLE = 5; FREE_POSTS_PER_CYCLE = 10; FREE_MAX_PER_DAY = 40
 CYCLE_AUTOPOST=900; CYCLE_SHORT_FREE=14400; CYCLE_MARKET_SUMMARY=16200
 CYCLE_PREDICT=14400; CYCLE_ALPHA_SUMMARY=14400; CYCLE_BOTTOMS_AUTO=21600
 CYCLE_GOLDEN=18000; CYCLE_PROMO=604800; CROSS_CHECK_INTERVAL=3600
-SMART_PROFIT_DAYS=1; SMART_MAX_AGE_DAYS=2; SMART_FORCE_DAYS=1
+SMART_PROFIT_DAYS=99; SMART_MAX_AGE_DAYS=3; SMART_FORCE_DAYS=99   # live-only early exits off: live == backtest (48h time stop only)
 SMART_FILL_TRIGGER=0.8; CLEANUP_EVERY_CYCLES=12
-BE_OFFSET_R=0.05; TRAIL_ATR=2.0; MAX_HOLD=1   # hard cap: 4 hours (one 4H bar)
+BE_OFFSET_R=0.05; TRAIL_ATR=2.0; MAX_HOLD_HOURS=48; MAX_HOLD=12   # hard cap: 48 hours (12 x 4H bars)
 
 # ===== Ryma v10: single source of truth (live signals, radars, tracking and /bt all read THESE numbers) =====
 V10_RR=(1.0,1.7,2.6,3.8); V10_FRACS=(0.35,0.30,0.20,0.15)      # targets in R and the share closed at each
 V10_ATR_MULT=1.6; V10_RISK_MIN_PCT=0.0035; V10_RISK_MAX_PCT=0.025  # stop = 1.6*ATR(15m) clamped to 0.35%..2.5%
-V10_EXEC_TF="15m"; V10_MAX_HOLD_BARS=16                          # 16 x 15m = 4 hours maximum
+V10_EXEC_TF="15m"; V10_MAX_HOLD_BARS=192                          # 192 x 15m = 48 hours maximum
 FUNDING_8H=0.0001                                                # funding estimate charged per 8h held (live + /bt)
-ALLOW_C_POSTS=_e("ALLOW_C_POSTS","1")=="1"                      # publish Grade C only with explicit high-risk warning
+ALLOW_C_POSTS=_e("ALLOW_C_POSTS","0")=="1"                      # grade C = radar only (no confirmed 15M trigger): never published unless explicitly enabled
+FREE_TP_COUNT=3; VIP_TP_COUNT=4                                  # FREE sees 3 targets, VIP sees 4
+VIP_B_PER_DAY=_int("VIP_B_PER_DAY",3); VIP_B_MIN_SCORE=_int("VIP_B_MIN_SCORE",7)   # best B setups are ALSO sent to VIP (4 targets)
+VIP_RESULTS_IN_FREE=_e("VIP_RESULTS_IN_FREE","1")=="1"         # mirror VIP results (wins AND losses) into FREE as teasers
+VIP_CHART_MODE=_e("VIP_CHART_MODE","pattern").lower()           # pattern = chart only for A trades / when a pattern is detected
+RYMA_AUTOPOST=_e("RYMA_AUTOPOST","0" if TRENDSPIDER_ENABLED else "1")=="1"   # own scanner: off when TrendSpider is the trigger
+SHORT_FREE_LOOP=_e("SHORT_FREE_LOOP","0")=="1"                  # legacy RSI-only short list for FREE: off by default
 BT_MAX_DECISIONS=max(200,min(50000,_int("BT_MAX_DECISIONS",20000)))
 SHADOW_MAX_OPEN=60
 
@@ -1898,10 +1904,10 @@ def scan_sync(symbols,workers=SCAN_WORKERS):
 
 def _is_shadow(p): return bool(p.get("shadow")) or p.get("setup")=="RADAR"
 
-MAX_HOLD_BARS_BY_TF = {"15m":V10_MAX_HOLD_BARS, "30m":8, "1h":4, "4h":1, "1d":1}
+MAX_HOLD_BARS_BY_TF = {"15m":V10_MAX_HOLD_BARS, "30m":96, "1h":48, "4h":12, "1d":2}
 
 def max_hold_bars(tf, requested=None):
-    """Return a hard-capped holding period: never more than four wall-clock hours."""
+    """Return a hard-capped holding period: never more than MAX_HOLD_HOURS wall-clock hours."""
     cap=int(MAX_HOLD_BARS_BY_TF.get(tf, 1))
     try:
         wanted=int(requested) if requested is not None else cap
@@ -1912,7 +1918,7 @@ def max_hold_bars(tf, requested=None):
 def new_trade(sym,tf,side,lv,bar_t,grade,setup,size_pct=0.05,shadow=False,max_hold=None):
     created_ms=int(time.time()*1000)
     hold=max_hold_bars(tf,max_hold)
-    expiry_ms=created_ms+min(hold*TF_MS.get(tf,TF_MS["15m"]),4*60*60*1000)
+    expiry_ms=created_ms+min(hold*TF_MS.get(tf,TF_MS["15m"]),MAX_HOLD_HOURS*60*60*1000)
     return dict(id=f"{sym}-{tf}-{bar_t}"+("-S" if shadow else ""),coin=sym,tf=tf,side=side,grade=grade,setup=setup,
                 entry=lv["entry"],sl=lv["sl"],original_sl=lv["sl"],risk=lv["risk"],shadow=bool(shadow),
                 size_pct=size_pct,tps=[dict(t) for t in lv["tps"]],state="open",
@@ -1927,7 +1933,7 @@ def trade_cost_r(p):
     """Round-trip fees + slippage + funding estimate, in R. Same formula for live trades and /bt."""
     fill=float(p.get("fill") or p.get("entry") or 0.0); risk=float(p.get("risk") or 0.0)
     if fill<=0 or risk<=0: return 0.0
-    hours=min(4.0,max(0,int(p.get("bars",0)))*TF_MS.get(p.get("tf"),TF_MS["15m"])/3_600_000)
+    hours=min(float(MAX_HOLD_HOURS),max(0,int(p.get("bars",0)))*TF_MS.get(p.get("tf"),TF_MS["15m"])/3_600_000)
     return (2*(FEE+SLIP)+FUNDING_8H*hours/8.0)*fill/risk
 
 def _finish(p,ev,kind):
@@ -1974,7 +1980,7 @@ def trade_step(p,o,h,l,c,atr):
     if (s==1 and l<=p["sl"]) or (s==-1 and h>=p["sl"]):
         kind="TRAIL" if p["trail_on"] else ("BE" if p["be"] else "SL")
         return close_at(p,float(p["sl"]),kind,ev)
-    # Bar-count stop is capped at four hours for every timeframe.
+    # Bar-count stop is capped at MAX_HOLD_HOURS for every timeframe.
     tf_hold=max_hold_bars(p.get("tf"),p.get("max_hold"))
     if p["bars"]>=tf_hold: return close_at(p,c,"TIME",ev)
     return ev
@@ -2027,10 +2033,10 @@ def _trade_expiry_ms(p, now_ms=None):
     hold=max_hold_bars(tf,p.get("max_hold"))
     created=int(p.get("created") or p.get("opened") or now_ms)
     tf_duration=TF_MS.get(tf,TF_MS["15m"])
-    hard_deadline=created+4*60*60*1000
+    hard_deadline=created+MAX_HOLD_HOURS*60*60*1000
     calculated=min(created+hold*tf_duration,hard_deadline)
     expiry=int(p.get("expires_at") or calculated)
-    # Clamp old persisted records too: a legacy expiry must never extend beyond four hours.
+    # Clamp old persisted records too: a legacy expiry must never extend beyond MAX_HOLD_HOURS.
     expiry=min(expiry,hard_deadline,calculated)
     if p.get("expires_at")!=expiry or p.get("max_hold")!=hold:
         p["expires_at"]=expiry
@@ -2109,7 +2115,7 @@ def _archive(p):
             source=p.get("source","binance_fut"),R=p["R"],result=p["result"],opened=p["opened"],closed=p["closed"],
             bars=p["bars"],tps=sum(1 for t in p["tps"] if t["hit"]),
             mfe=round(p["mfe"],2),mae=round(p["mae"],2),fill=p.get("fill"),sl=p.get("sl"),
-            tps_list=[dict(t) for t in p["tps"]],realized=p.get("realized",0.0),shadow=_is_shadow(p)))
+            tps_list=[dict(t) for t in p["tps"]],realized=p.get("realized",0.0),shadow=_is_shadow(p),tier=p.get("tier","both"),trigger=p.get("trigger","Ryma")))
         del store.data["history"][:-1500]
         cutoff=time.time()*1000-3*DAY*1000
         store.data["signals"]=[q for q in store.data["signals"]
@@ -2135,45 +2141,34 @@ def grade_history_stats(grade=None, limit=500):
         return None
 
 
-def format_trade_card(p,event_kind=None,event_data=None):
-    side = p.get("side", 1)
-    side_lbl = "LONG" if side == 1 else "SHORT"
-    dot = "🔵" if side == 1 else "🔴"
-    coin = p.get("coin") or p.get("sym") or "?"
-    lines = [
-        f"{dot} <b>{coin}/USDT {side_lbl}</b>",
-        "",
-        f"{dot} Entry: {fmt(p.get('fill') or p.get('entry') or 0)}",
-        f"📡 Source: {display_source(p.get('source','binance_fut'))}",
-    ]
-    for i, tp in enumerate(p.get("tps") or [], 1):
-        check = "✅" if tp.get("hit") else ""
-        lines.append(f"🎯 TP{i}: {fmt(tp['px'])}{check}")
-    if p.get("be") and p.get("trail_on"):
-        lines.append(f"🛑 Trail SL: {fmt(p['sl'])}")
-    elif p.get("be"):
-        lines.append(f"🛑 BE: {fmt(p['sl'])}")
-    else:
-        lines.append(f"🛑 SL: {fmt(p['sl'])}")
-    tp_hits = sum(1 for t in (p.get("tps") or []) if t.get("hit"))
-    lines += ["", f"📊 R: {p.get('realized', 0.0):+.2f} | TP: {tp_hits}/{len(p.get('tps') or [])}"]
-    # شفافية تاريخية حسب الدرجة (مفيد للأدمن والمشترك)
-    st = grade_history_stats(p.get("grade"))
-    if st and st["n"] >= 5:
-        lines.append(f"📊 درجة {p.get('grade','?')}: نجاح تاريخي {st['rate']}% من {st['n']} صفقة")
-    if p.get("state") == "closed":
-        labels = {"TP": "✅ صفقة ناجحة بالكامل", "SL": "🛑 ضرب وقف الخسارة", "BE": "🔒 خروج على التعادل",
-                  "TRAIL": "🔁 خروج بالوقف المتحرك", "TIME": "⏱ انتهت المدة", "PROFIT_TAKE": "💰 أخذ الربح الذكي",
-                  "SMART_EXIT": "🧹 خروج ذكي", "AGE_CLOSE": "📅 انتهاء العمر"}
-        lines += ["", f"{labels.get(p.get('result', ''), '🏁 انتهت')} | {p.get('R', 0):+.2f}R"]
-    lines += ["", "📋 تنبيه معلومات — البوت لا ينفّذ صفقات"]
+def format_trade_card(p,event_kind=None,event_data=None,tier="vip"):
+    side=p.get("side",1); side_lbl="LONG" if side==1 else "SHORT"; dot="🔵" if side==1 else "🔴"
+    coin=p.get("coin") or p.get("sym") or "?"
+    tps_all=p.get("tps") or []; tps=tps_all[:FREE_TP_COUNT] if tier=="free" else tps_all
+    lines=[f"{dot} <b>{coin}/USDT {side_lbl}</b>","",f"{dot} Entry: {fmt(p.get('fill') or p.get('entry') or 0)}",
+           f"📡 Source: {display_source(p.get('source','binance_fut'))}"]
+    for i,tp in enumerate(tps,1): lines.append(f"🎯 TP{i}: {fmt(tp['px'])}{'✅' if tp.get('hit') else ''}")
+    if p.get("be") and p.get("trail_on"): lines.append(f"🛑 Trail SL: {fmt(p['sl'])}")
+    elif p.get("be"): lines.append(f"🛑 BE: {fmt(p['sl'])}")
+    else: lines.append(f"🛑 SL: {fmt(p['sl'])}")
+    hits=sum(1 for t in tps if t.get("hit"))
+    if tier=="free": lines+=["",f"📊 الأهداف المحققة: {hits}/{len(tps)}"]
+    else: lines+=["",f"📊 R: {p.get('realized',0.0):+.2f} | TP: {hits}/{len(tps)}"]
+    st=grade_history_stats(p.get("grade"))
+    if st and st["n"]>=5: lines.append(f"📊 درجة {p.get('grade','?')}: نجاح تاريخي {st['rate']}% من {st['n']} صفقة")
+    if p.get("state")=="closed":
+        labels={"TP":"✅ صفقة ناجحة بالكامل","SL":"🛑 ضرب وقف الخسارة","BE":"🔒 خروج على التعادل","TRAIL":"🔁 خروج بالوقف المتحرك",
+                "TIME":"⏱ انتهت المدة","PROFIT_TAKE":"💰 أخذ الربح الذكي","SMART_EXIT":"🧹 خروج ذكي","AGE_CLOSE":"📅 انتهاء العمر"}
+        tail=labels.get(p.get("result",""),"🏁 انتهت")
+        lines+=["",tail if tier=="free" else f"{tail} | {p.get('R',0):+.2f}R"]
+    lines+=["","📋 تنبيه معلومات — البوت لا ينفّذ صفقات"]
     return "\n".join(lines)
 
 
 def event_text(coin,tf,side,e,R,tier="free",trade=None):
     k=e["kind"]
     if trade is not None:
-        card=format_trade_card(trade,k,e)
+        card=format_trade_card(trade,k,e,tier=tier)
         headers={"TP":f"🎯 <b>تحقق الهدف {e['j']}</b>\n\n","SL":"🛑 <b>ضرب وقف الخسارة</b>\n\n",
                  "BE":"🔒 <b>خروج على التعادل</b>\n\n","TRAIL":"🔁 <b>خروج بالوقف المتحرك</b>\n\n",
                  "TIME":"⏱ <b>انتهت المدة</b>\n\n","BE_MOVED":"🔒 <b>نُقل الوقف للتعادل</b>\n\n",
@@ -2965,6 +2960,7 @@ def caption_wait(res,lang="ar"):
 
 def caption_core(res,tier="free",lang="ar"):
     if res.get("wait"): return caption_wait(res,lang)
+    if lang!="en": return caption_vip_ar(res) if tier=="vip" else caption_free_ar(res)
     side,lv,sym=res["side"],res["lv"],res["sym"]
     if lang=="en":
         side_word="🟢 LONG" if side==1 else "🔴 SHORT"
@@ -2978,7 +2974,7 @@ def caption_core(res,tier="free",lang="ar"):
             f"┃ 📡 Source: {source}",f"┃ 🏆 Grade: {grade}",
             "╰━━━━━━━━━━━━━━━━━━━━━━━╯","",f"💵 Entry: {fmt(lv['entry'])}",
             f"🛑 Stop Loss: {fmt(lv['sl'])}",
-            "⏱ Frames: 4H regime · 1H confirm · 15M execution | Max hold: 4 hours",
+            "⏱ Frames: 4H regime · 1H confirm · 15M execution | Max hold: 48 hours",
             "📊 Confidence: not calibrated (rule-based grade only)",""]
         n_tps=4
         for i,tp in enumerate(lv["tps"][:n_tps],1):
@@ -3026,11 +3022,13 @@ def caption_core(res,tier="free",lang="ar"):
         f"┃ 📡 المصدر: {source}",f"┃ 🏆 الدرجة: {grade}",
         "╰━━━━━━━━━━━━━━━━━━━━━━━╯","",f"💵 الدخول: {fmt(lv['entry'])}",
         f"🛑 وقف الخسارة: {fmt(lv['sl'])}",
-        "⏱ الإطارات: 4س نظام · 1س تأكيد · 15د تنفيذ | أقصى مدة: 4 ساعات",
+        "⏱ الإطارات: 4س نظام · 1س تأكيد · 15د تنفيذ | أقصى مدة: 48 ساعة",
         "📊 الثقة الرقمية غير معايرة؛ الدرجة تقييم قواعدي فقط",""]
     n_tps=4
     for i,tp in enumerate(lv["tps"][:n_tps],1):
         emoji="🎯" if i<=2 else "🏆"; lines.append(f"{emoji} الهدف {i}: {fmt(tp['px'])}")
+    if res.get("trendspider_alert"):
+        lines.append("🔔 المحفّز: TrendSpider · المستويات يتحقق منها/يحسبها Ryma")
     
     pats=res.get("patterns",[])
     if pats:
@@ -3229,66 +3227,204 @@ def track_signal(res,shadow=False):
     p=new_trade(res["sym"],tf,res["side"],res["lv"],res["bar_t"],res["grade"],"RADAR" if shadow else res["setup"],
                 size_pct=sz,shadow=shadow)
     p["source"]=normalize_futures_source(res.get("source","binance_fut"))
+    p["tier"]=res.get("tier","both"); p["trigger"]="TrendSpider" if res.get("trendspider_alert") else "Ryma"
     with store.lock: store.data["signals"].append(p); store.save("signals")
     return p
 
 async def publish(bot,res,vip=True,free=False,admin_copy=False):
-    """ينشر نص الصفقة أولاً (مهم للقنوات) ثم الشارت إن أمكن — بدون تعطيل عند فشل الصورة."""
+    """VIP: text + (TradingView-style chart when a pattern exists / A trade). FREE: text only. Failures never block the other channel."""
     if res.get("wait"): return []
     sent=[]; source=res.get("source","binance_fut")
-    text_vip = caption_core(res, tier="vip", lang="ar")
-    text_free = caption_core(res, tier="free", lang="ar")
-    copy_text = build_copy_post(res)
-    # شفافية تاريخية للأدمن
-    st = grade_history_stats(res.get("grade"))
-    admin_extra = ""
-    if st and st["n"] >= 5:
-        admin_extra = f"\n📊 [أدمن] درجة {res.get('grade')}: نجاح تاريخي {st['rate']}% من {st['n']} صفقة"
+    text_vip=caption_core(res,tier="vip",lang="ar"); text_free=caption_core(res,tier="free",lang="ar")
+    copy_text=build_copy_post(res)
+    st=grade_history_stats(res.get("grade")); admin_extra=""
+    if st and st["n"]>=5:
+        admin_extra=f"\n📊 [أدمن] درجة {res.get('grade')}: نجاح تاريخي {st['rate']}% من {st['n']} صفقة"
     try:
-        kb_v = keyboard_vip(res["sym"], res["tf"], source, "ar")
-        kb_f = keyboard_free(res["sym"], res["tf"], source, "ar")
+        kb_v=keyboard_vip(res["sym"],res["tf"],source,"ar"); kb_f=keyboard_free(res["sym"],res["tf"],source,"ar")
         if vip and VIP_CHANNEL_ID:
             try:
-                await bot.send_message(VIP_CHANNEL_ID, text_vip[:4000], parse_mode=ParseMode.HTML,
-                                       protect_content=PROTECT, reply_markup=kb_v,
-                                       link_preview_options=NO_PREVIEW)
+                await bot.send_message(VIP_CHANNEL_ID,text_vip[:4000],parse_mode=ParseMode.HTML,protect_content=PROTECT,
+                                       reply_markup=kb_v,link_preview_options=NO_PREVIEW)
                 sent.append("VIP_TEXT")
-            except Exception as e:
-                log.warning("vip text: %s", e)
-            try:
-                img = await asyncio.to_thread(render_chart, res, "vip", True)
-                await bot.send_photo(VIP_CHANNEL_ID, img, protect_content=PROTECT, reply_markup=kb_v)
-                sent.append("VIP_CHART")
-            except Exception as e:
-                log.debug("vip chart skip: %s", e)
+            except Exception as e: log.warning("vip text: %s",e)
+            if VIP_CHART_MODE!="never":
+                try:
+                    img,pats=await asyncio.to_thread(build_tv_for,res["sym"],res["tf"],res)
+                    real=[p for p in pats if not str(p.get("name","")).startswith(("Trend","Range"))]
+                    if VIP_CHART_MODE=="always" or real or res.get("grade") in ("A+","A"):
+                        await bot.send_photo(VIP_CHANNEL_ID,img,caption=tv_caption(res["sym"],res["tf"],pats)[:1000],
+                                             parse_mode=ParseMode.HTML,protect_content=PROTECT,reply_markup=kb_v)
+                        sent.append("VIP_CHART")
+                except Exception as e: log.debug("vip chart skip: %s",e)
         if free and CHANNEL_ID:
             try:
-                await bot.send_message(CHANNEL_ID, text_free[:4000], parse_mode=ParseMode.HTML,
-                                       protect_content=PROTECT, reply_markup=kb_f,
-                                       link_preview_options=NO_PREVIEW)
+                await bot.send_message(CHANNEL_ID,text_free[:4000],parse_mode=ParseMode.HTML,protect_content=PROTECT,
+                                       reply_markup=kb_f,link_preview_options=NO_PREVIEW)
                 sent.append("FREE_TEXT")
-            except Exception as e:
-                log.warning("free text: %s", e)
-            try:
-                img = await asyncio.to_thread(render_chart, res, "free", True)
-                await bot.send_photo(CHANNEL_ID, img, protect_content=PROTECT, reply_markup=kb_f)
-                sent.append("FREE_CHART")
-            except Exception as e:
-                log.debug("free chart skip: %s", e)
+            except Exception as e: log.warning("free text: %s",e)
         if admin_copy and ADMIN_ID:
             try:
-                await bot.send_message(ADMIN_ID, (copy_text + admin_extra)[:4000], parse_mode=ParseMode.HTML,
-                                       link_preview_options=NO_PREVIEW)
-            except Exception as _ex:
-                log.debug("admin copy: %s", _ex)
+                await bot.send_message(ADMIN_ID,(copy_text+admin_extra)[:4000],parse_mode=ParseMode.HTML,link_preview_options=NO_PREVIEW)
+            except Exception as _ex: log.debug("admin copy: %s",_ex)
             try:
-                card = await asyncio.to_thread(render_trade_card, res, "admin")
-                await bot.send_photo(ADMIN_ID, card)
-            except Exception as _ex:
-                log.debug("admin card: %s", _ex)
+                card=await asyncio.to_thread(render_trade_card,res,"admin")
+                await bot.send_photo(ADMIN_ID,card)
+            except Exception as _ex: log.debug("admin card: %s",_ex)
     except Exception as e:
         sent.append(f"err:{str(e)[:40]}")
     return sent
+
+
+# ======================= RC7: two-tier channel model (FREE = B/C · VIP = A + selected B) =======================
+_vip_b_day={"d":"","n":0}
+TIER_LABEL={"A+":"⭐ صفقة قوية A+","A":"⭐ صفقة قوية A","B":"🔹 فرصة B","C":"👁 صفقة مراقبة C"}
+
+def _lv_with_n_tps(lv,n):
+    """Copy of the levels with the first n targets only; fractions re-normalised so they still sum to 1."""
+    tps=[dict(t) for t in lv["tps"][:n]]
+    tot=sum(float(t.get("frac",0)) for t in tps) or 1.0
+    for t in tps: t["frac"]=round(float(t.get("frac",0))/tot,4)
+    out=dict(lv); out["tps"]=tps; return out
+
+def route_tier(res):
+    """A/A+ -> VIP only · B -> FREE (and VIP too for the best few per day) · C -> FREE only."""
+    g=res.get("grade","C")
+    if g in ("A+","A"): return "vip"
+    if g=="B":
+        today=dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
+        if _vip_b_day["d"]!=today: _vip_b_day.update(d=today,n=0)
+        if VIP_CHANNEL_ID and _vip_b_day["n"]<VIP_B_PER_DAY and float(res.get("score",0))>=VIP_B_MIN_SCORE: return "both"
+    return "free"
+
+def _ts_lines(res):
+    ta=res.get("trendspider_alert")
+    if not ta: return []
+    nm=str(ta.get("strategy") or "").strip()
+    out=["🔔 المحفّز: TrendSpider"+(f" · {nm}" if nm else "")]
+    conf={"full":"✅ تأكيد Ryma: كامل (4H + 1H + 15M)",
+          "partial":"🟡 تأكيد Ryma: جزئي — الاتجاه متوافق والمحفّز من TrendSpider",
+          "none":"⚪ تأكيد Ryma: بدون — إشارة TrendSpider منفردة، خفّض الحجم"}.get(res.get("ts_confirm"))
+    if conf: out.append(conf)
+    return out
+
+def caption_free_ar(res):
+    lv=res["lv"]; sym=res["sym"]; side=res["side"]; grade=res.get("grade","C")
+    cl=coin_link(sym,res.get("source","binance_fut"))
+    word="شراء (LONG)" if side==1 else "بيع (SHORT)"
+    lines=[f"{'🟢' if side==1 else '🔴'} <b>{word}</b> · <a href='{cl}'>#{sym}/USDT</a> 👆",
+           f"{TIER_LABEL.get(grade,grade)} · ⏱ المدة: حتى {MAX_HOLD_HOURS} ساعة","━━━━━━━━━━━━━━",
+           f"💵 الدخول: <code>{fmt(lv['entry'])}</code>",f"🛑 وقف الخسارة: <code>{fmt(lv['sl'])}</code>"]
+    for i,tp in enumerate(lv["tps"][:FREE_TP_COUNT],1): lines.append(f"🎯 الهدف {i}: <code>{fmt(tp['px'])}</code>")
+    lines.append("━━━━━━━━━━━━━━")
+    lines+=_ts_lines(res)
+    lines.append(f"📡 {display_source(res.get('source','binance_fut'))}")
+    if grade=="C":
+        lines+=["","⚠️ <b>مخاطرة أعلى:</b> تأكيد Ryma ضعيف — استخدم نصف حجمك المعتاد أو أقل والتزم بالوقف."]
+    lines+=["","🔄 بعد تحقق الهدف الأول يُنقل الوقف قرب الدخول. نتابع الصفقة هنا حتى نهايتها (ربحًا أو خسارة).",
+            "","💎 <b>VIP</b>: صفقات A القوية + الهدف الرابع + شارتات بنماذج فنية + متابعة لحظية — للاشتراك تواصل معنا 👇",
+            RISK_WARNING_AR,f"👤 {BRAND}"]
+    return "\n".join(lines)
+
+def caption_vip_ar(res):
+    lv=res["lv"]; sym=res["sym"]; side=res["side"]; grade=res.get("grade","B")
+    cl=coin_link(sym,res.get("source","binance_fut"))
+    word="🟢 شراء (LONG)" if side==1 else "🔴 بيع (SHORT)"
+    lines=["╭━━━ 💎 RYMA VIP 💎 ━━━╮",f"┃ 🎯 {word}",f"┃ 📌 <a href='{cl}'>#{sym}/USDT</a> 👆",
+           f"┃ {TIER_LABEL.get(grade,grade)}",f"┃ 📡 {display_source(res.get('source','binance_fut'))}",
+           "╰━━━━━━━━━━━━━━━━━━━━━━━╯","",
+           f"💵 الدخول: <code>{fmt(lv['entry'])}</code>",f"🛑 وقف الخسارة: <code>{fmt(lv['sl'])}</code>"]
+    for i,tp in enumerate(lv["tps"][:VIP_TP_COUNT],1):
+        lines.append(f"{'🎯' if i<=2 else '🏆'} الهدف {i}: <code>{fmt(tp['px'])}</code>")
+    lines+=["",f"⏱ المدة: حتى {MAX_HOLD_HOURS} ساعة",
+            "🔄 الإدارة: بعد الهدف 1 → الوقف قرب الدخول · بعد الهدف 2 → وقف متحرك"]
+    lines+=[""]+_ts_lines(res)
+    why=[str(x) for x in (res.get("reasons") or [])[:3]]
+    if why: lines+=["","🧭 <b>سبب الفرصة:</b>"]+[f"• {x}" for x in why]
+    pats=res.get("patterns",[])
+    if pats:
+        lines.append("🕯 النموذج: "+" | ".join(f"{p['name']}{'['+p.get('tf','').upper()+']' if p.get('tf') else ''}" for p in pats[:2]))
+    lines+=["",RISK_WARNING_AR,f"👤 {BRAND}"]
+    return "\n".join(x for x in lines if x is not None)
+
+def vip_result_teaser(coin,side,e,trade):
+    """FREE-channel post about a VIP trade: coin, direction and outcome only (never entry/levels). Losses are always included."""
+    k=e["kind"]; n=len(trade.get("tps") or []); hits=sum(1 for t in (trade.get("tps") or []) if t.get("hit"))
+    d="🟢 LONG" if side==1 else "🔴 SHORT"
+    if k=="TP": head=f"✅ تحقق الهدف {e.get('j')} من {n}"
+    elif k=="SL": head="🛑 ضربت وقف الخسارة"
+    elif k=="BE": head="🔒 أُغلقت عند التعادل"+(" بعد تأمين جزء من الربح" if hits else "")
+    elif k=="TRAIL": head="🔁 أُغلقت بالوقف المتحرك"
+    else: head="⏱ أُغلقت بانتهاء المدة"
+    lines=["💎 <b>نتيجة صفقة VIP</b>","",f"#{coin}/USDT · {d}",head]
+    if trade.get("state")=="closed" and trade.get("R") is not None:
+        lines.append(f"📊 النتيجة النهائية: <b>{float(trade['R']):+.2f}R</b> · الأهداف المحققة {hits}/{n}")
+    lines+=["","👀 الدخول والأهداف قبل تحققها تُنشر في VIP فقط — للاشتراك تواصل معنا.",RISK_WARNING_AR]
+    return "\n".join(lines)
+
+async def _send_photo_safe(bot,chat,data):
+    try: await bot.send_photo(chat,io.BytesIO(data),protect_content=PROTECT)
+    except Exception as ex: log.warning("result photo %s: %s",chat,str(ex)[:80])
+
+async def _announce_event(bot,coin,tf,side,e,R,trade):
+    """Route one tracker event: VIP gets everything of its trades; FREE gets its own trades (3 targets) and teasers for VIP trades."""
+    tier=trade.get("tier","both"); k=e["kind"]; j=int(e.get("j") or 0)
+    to_vip=tier in ("vip","both"); to_free=tier in ("free","both")
+    free_event=to_free and not (k=="TP" and j>FREE_TP_COUNT)
+    if k in ("TP","SL","BE","TRAIL","TIME") and (to_vip or (tier=="free" and free_event)):
+        try:
+            data=(await asyncio.to_thread(render_result_card,coin,tf,side,e,trade)).getvalue()
+            if to_vip and VIP_CHANNEL_ID: await _send_photo_safe(bot,VIP_CHANNEL_ID,data)
+            if tier=="free" and free_event and CHANNEL_ID: await _send_photo_safe(bot,CHANNEL_ID,data)
+        except Exception: log.exception("result card")
+    if to_vip:
+        msg=event_text(coin,tf,side,e,R,"vip",trade=trade)
+        if msg: await notify_both(bot,msg,protect=True)
+    if free_event and CHANNEL_ID:
+        msg=free_event_text(coin,tf,side,e,R,trade)
+        if msg: await notify_free(bot,msg)
+    if tier=="vip" and VIP_RESULTS_IN_FREE and CHANNEL_ID and k in ("TP","SL","BE","TRAIL","TIME"):
+        await notify_free(bot,vip_result_teaser(coin,side,e,trade))
+
+async def dispatch_signal(bot,res,admin_copy=True):
+    """Single publishing path (TrendSpider and own scanner): decide tier, trim targets for FREE, publish, then track."""
+    res=dict(res)                                     # never mutate the shared analysis cache
+    tier=route_tier(res); res["tier"]=tier
+    if tier=="free": res["lv"]=_lv_with_n_tps(res["lv"],FREE_TP_COUNT)
+    sent=await publish(bot,res,vip=tier in ("vip","both"),free=tier in ("free","both"),admin_copy=admin_copy)
+    vip_ok=_sent_ok(sent,"VIP_"); free_ok=_sent_ok(sent,"FREE_")
+    ok=vip_ok if tier=="vip" else (free_ok if tier=="free" else (vip_ok or free_ok))
+    if ok:
+        if tier=="both" and vip_ok: _vip_b_day["n"]+=1
+        _mark_posted(res)
+    return tier,sent,ok,res
+
+def _trendspider_signal(alert):
+    """TrendSpider decides direction and timing. Ryma contributes the price, ATR-based levels and a confluence grade:
+    A/B = Ryma's own engine confirms (full) · B/C = direction agrees but no 15M trigger (partial) · C = Ryma neutral/against (none).
+    A confirmed Ryma opportunity in the OPPOSITE direction vetoes the alert."""
+    sym=alert["symbol"]; side=int(alert["side"])
+    if sym in WEAK_COINS or sym in EXCLUDE_TICKERS: return None
+    base=get_analysis(sym,True)
+    if not base or not base.get("lv") or base.get("wait"):
+        log.info("TrendSpider alert skipped: no usable Ryma analysis for %s",sym); return None
+    agree=int(base.get("side",0))==side
+    if not agree and base.get("opportunity"):
+        log.info("TrendSpider alert vetoed: Ryma has a confirmed opposite opportunity on %s",sym); return None
+    price=float(base["price"]); atr=float(base["lv"].get("atr") or 0.0)
+    if price<=0: return None
+    lv=base["lv"] if agree else v10_levels(price,side,atr if atr>0 else None)
+    if agree and base.get("opportunity"):
+        grade=base.get("grade","B"); grade=grade if grade in ("A+","A","B") else "B"; confirm="full"
+    elif agree:
+        grade="B" if float(base.get("score",0))>=5 else "C"; confirm="partial"
+    else:
+        grade="C"; confirm="none"
+    res=dict(base)
+    res.update(side=side,lv=lv,grade=grade,rank={"A+":2,"A":2,"B":1,"C":0}[grade],opportunity=True,forced=False,
+               setup="TS",strategy="TrendSpider",ts_confirm=confirm,
+               trendspider_alert={"id":alert["id"],"timestamp":alert["timestamp"],"strategy":alert.get("strategy","")})
+    return res
 
 def build_market_summary(symbols):
     now_ts=dt.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -3347,35 +3483,30 @@ async def run_autopost(bot):
     log.info("run_autopost: بدء المسح")
     syms=await asyncio.to_thread(top_symbols,60)
     results=await asyncio.to_thread(scan_sync,syms[:40])
-    # radar -> opportunity: only a CONFIRMED v10 opportunity (regime + 1H + fresh 15M trigger) is published.
+    # own scanner: only CONFIRMED opportunities (regime + 1H + fresh 15M trigger); tiering decided by route_tier()
     cands=[r for r in results if (r.get("opportunity") or ALLOW_C_POSTS) and _grade_ok(r["grade"])
            and r["sym"] not in WEAK_COINS and r["sym"] not in EXCLUDE_TICKERS]
     today=dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
     if _free_day["d"]!=today: _free_day.update(d=today,n=0)
-    key=lambda r:(-r.get("score",0),-r["rank"])
-    a_candidates=sorted([r for r in cands if r["grade"] in ("A+","A")],key=key)
-    b_candidates=sorted([r for r in cands if r["grade"]=="B"],key=key)
-    c_candidates=sorted([r for r in cands if r["grade"]=="C"],key=key)
     if len(active_signals())>=MAX_OPEN:
         log.warning(f"MAX_OPEN {len(active_signals())}/{MAX_OPEN}"); return dict(vip=0,free=0,total=0)
-    vip_n=free_n=0; used=set()
-    for r in a_candidates+b_candidates:
-        if vip_n>=VIP_POSTS_PER_CYCLE: break
+    order=sorted(cands,key=lambda r:(-{"A+":3,"A":2,"B":1,"C":0}.get(r["grade"],0),-r.get("score",0),-r["rank"]))
+    vip_n=free_n=posted=0
+    for r in order:
+        tier=route_tier(r)
+        if tier in ("vip","both") and vip_n>=VIP_POSTS_PER_CYCLE: continue
+        if tier in ("free","both") and (free_n>=FREE_POSTS_PER_CYCLE or _free_day["n"]>=FREE_MAX_PER_DAY):
+            if tier=="free": continue
         if not _can_post(r): continue
-        try: sent=await publish(bot,r,vip=True,free=False,admin_copy=False)
+        try: tier,sent,ok,_r=await dispatch_signal(bot,r,admin_copy=False)
         except Exception: continue
-        if _sent_ok(sent,"VIP_"):
-            _mark_posted(r); vip_n+=1; used.add(r["sym"]); await asyncio.sleep(1.0)
-    for r in b_candidates+c_candidates:
-        if r["sym"] in used: continue
-        if free_n>=FREE_POSTS_PER_CYCLE or _free_day["n"]>=FREE_MAX_PER_DAY: break
-        if not _can_post(r): continue
-        try: sent=await publish(bot,r,vip=False,free=True,admin_copy=False)
-        except Exception: continue
-        if _sent_ok(sent,"FREE_"):
-            _mark_posted(r); free_n+=1; _free_day["n"]+=1; used.add(r["sym"]); await asyncio.sleep(1.0)
+        if ok:
+            posted+=1
+            if tier in ("vip","both"): vip_n+=1
+            if tier in ("free","both"): free_n+=1; _free_day["n"]+=1
+            await asyncio.sleep(1.0)
     log.info(f"run_autopost: VIP={vip_n}, FREE={free_n}")
-    return dict(vip=vip_n,free=free_n,total=vip_n+free_n)
+    return dict(vip=vip_n,free=free_n,total=posted)
 
 def build_promo_post():
     lines=["💎✨ <b>لماذا نتداول على هذه المنصات؟</b> ✨💎","━━━━━━━━━━━━━━━━━━━━━","","🚀 <b>مزايا المنصات المعتمدة:</b>",""]
@@ -3394,7 +3525,7 @@ async def autopost_loop(app):
             now=time.time()
             nxt=(int(now//CYCLE_AUTOPOST)+1)*CYCLE_AUTOPOST+60
             await asyncio.sleep(max(5,nxt-now))
-            await run_autopost(app.bot)
+            if RYMA_AUTOPOST: await run_autopost(app.bot)
         except asyncio.CancelledError: raise
         except Exception: log.exception("autopost")
         await asyncio.sleep(60)
@@ -3483,16 +3614,8 @@ async def tracker_loop(app):
                 with store.lock:
                     found=next((dict(p) for p in store.data["signals"] if p.get("id")==trade_id),None)
                 if not found: continue
-                if e["kind"] in ("TP","SL","BE","TRAIL","TIME"):
-                    try:
-                        free_ok=True
-                        img=await asyncio.to_thread(render_result_card,coin,tf,side,e,found)
-                        await send_result_image(app.bot,img,free_ok)
-                    except Exception: log.exception("result card")
-                vip_msg=event_text(coin,tf,side,e,R,"vip",trade=found)
-                if vip_msg: await notify_both(app.bot,vip_msg,protect=True)
-                free_msg=free_event_text(coin,tf,side,e,R,found)
-                if free_msg and CHANNEL_ID: await notify_free(app.bot,free_msg)
+                try: await _announce_event(app.bot,coin,tf,side,e,R,found)
+                except Exception: log.exception("announce event")
         except asyncio.CancelledError: raise
         except Exception: log.exception("tracker")
         await asyncio.sleep(60)
@@ -4512,6 +4635,311 @@ def lab_report(name, per, tmin, tmax, errors=None, years=None):
         L += ["", f"⚠️ فشل {len(errors)} عملة: " + " | ".join(f"{k}: {v[:60]}" for k, v in list(errors.items())[:3])]
     return "\n".join(L)
 
+
+# ======================================================================================================================
+# Swing lab (backtest-only): low-frequency strategies where costs are small relative to the move.
+# ======================================================================================================================
+SWING_DEFAULTS = dict(don_n=55, exit_n=20, atr_n=20, stop_atr=3.0, ema_n=200, max_hold=250, mom_n=28, hold_days=7, k=3)
+
+def _wilder_np(x, n):
+    return pd.Series(x).ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean().to_numpy()
+
+def trend_replay(d, params=None):
+    """Daily Donchian trend-following, long AND short.
+    Signal on the close of day j: close breaks the prior `don_n`-day high (low) with close above (below) EMA(ema_n).
+    Entry = open of day j+1. Stop = entry -/+ stop_atr*ATR. Exit = intraday stop (fills at the open when gapped),
+    or a close beyond the prior `exit_n`-day low (high) -> exit at the NEXT open, or max_hold. One position at a time.
+    R unit = initial risk. Cost = fees+slippage both ways + funding estimate (trade_cost_r)."""
+    p = dict(SWING_DEFAULTS); p.update(params or {})
+    t = d["t"].to_numpy("int64"); o = d["open"].to_numpy(float); h = d["high"].to_numpy(float)
+    l = d["low"].to_numpy(float); c = d["close"].to_numpy(float); n = len(c)
+    if n < p["ema_n"] + p["don_n"] + 10: return [], 0, 0
+    s = pd.Series
+    hi = s(h).shift(1).rolling(p["don_n"]).max().to_numpy(); lo = s(l).shift(1).rolling(p["don_n"]).min().to_numpy()
+    ex_lo = s(l).shift(1).rolling(p["exit_n"]).min().to_numpy(); ex_hi = s(h).shift(1).rolling(p["exit_n"]).max().to_numpy()
+    pc = np.concatenate([[c[0]], c[:-1]])
+    tr = np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
+    atr = _wilder_np(tr, p["atr_n"]); ema = s(c).ewm(span=p["ema_n"], adjust=False, min_periods=p["ema_n"]).mean().to_numpy()
+    first = max(p["ema_n"], p["don_n"]) + 2
+    trades = []; j = first; day = TF_MS["1d"]
+    while j < n - 1:
+        side = 0
+        if np.isfinite(hi[j]) and c[j] > hi[j] and c[j] > ema[j]: side = 1
+        elif np.isfinite(lo[j]) and c[j] < lo[j] and c[j] < ema[j]: side = -1
+        if side == 0 or not np.isfinite(atr[j]) or atr[j] <= 0: j += 1; continue
+        fill = float(o[j + 1]); risk = p["stop_atr"] * float(atr[j]); stop = fill - side * risk
+        if risk / fill > 0.35: j += 1; continue                         # absurd stop (>35% of price): skip
+        k = j + 1; exit_px = None; kind = None
+        while k < n:
+            if (side == 1 and l[k] <= stop) or (side == -1 and h[k] >= stop):
+                exit_px = min(o[k], stop) if side == 1 else max(o[k], stop); kind = "STOP"; break
+            if k - j >= p["max_hold"]: exit_px = float(c[k]); kind = "TIME"; break
+            brk = (side == 1 and np.isfinite(ex_lo[k]) and c[k] < ex_lo[k]) or (side == -1 and np.isfinite(ex_hi[k]) and c[k] > ex_hi[k])
+            if brk and k + 1 < n: exit_px = float(o[k + 1]); kind = "CHANNEL"; k += 1; break
+            k += 1
+        if exit_px is None: break                                       # still open at the end of data: not counted
+        bars = k - j; gross = side * (exit_px - fill) / risk
+        cost = (2 * (FEE + SLIP) + FUNDING_8H * (bars * 24) / 8.0) * fill / risk
+        trades.append(dict(t=int(t[j + 1]), signal_t=int(t[j]) + day, R=round(gross - cost, 4), gross_R=round(gross, 4), cost=round(cost, 4),
+                           exit=kind, bars=bars, side=side, grade="A", tps=0, entry=fill, risk_pct=round(100 * risk / fill, 3),
+                           hours=bars * 24.0, ret_pct=round(100 * side * (exit_px / fill - 1), 3), strategy="trend"))
+        j = k + 1                                                       # flat for the next day at least
+    return trades, int(t[first]), int(t[-1])
+
+
+def xsmom_replay(closes, opens, times, params=None):
+    """Weekly cross-sectional momentum. closes/opens: dict sym -> aligned numpy arrays over the SAME daily dates.
+    Every `hold_days` days (decision at the close of day j) rank symbols by their `mom_n`-day return, go long the top k
+    and short the bottom k; entries at the open of j+1, exits at the open of j+1+hold_days. Funding is charged to longs only.
+    Returns weekly rows: long/short/spread/benchmark net returns in % per week."""
+    p = dict(SWING_DEFAULTS); p.update(params or {})
+    syms = list(closes); n = len(times)
+    if len(syms) < 2 * p["k"] + 2 or n < p["mom_n"] + p["hold_days"] + 5: return []
+    C = np.vstack([closes[s] for s in syms]); O = np.vstack([opens[s] for s in syms])
+    rows = []; j = p["mom_n"]
+    cost_side = 2 * (FEE + SLIP) * 100.0
+    fund_long = FUNDING_8H * (p["hold_days"] * 3) * 100.0
+    while j + 1 + p["hold_days"] < n:
+        mom = C[:, j] / C[:, j - p["mom_n"]] - 1.0
+        ok = np.isfinite(mom) & np.isfinite(O[:, j + 1]) & np.isfinite(O[:, j + 1 + p["hold_days"]]) & (O[:, j + 1] > 0)
+        idx = np.where(ok)[0]
+        if len(idx) >= 2 * p["k"] + 2:
+            order = idx[np.argsort(mom[idx])]
+            shorts, longs = order[:p["k"]], order[-p["k"]:]
+            ret = (O[:, j + 1 + p["hold_days"]] / O[:, j + 1] - 1.0) * 100.0
+            lr = float(np.mean(ret[longs])) - cost_side - fund_long
+            sr = float(np.mean(-ret[shorts])) - cost_side
+            bench = float(np.mean(ret[idx]))
+            rows.append(dict(t=int(times[j + 1]), long=lr, short=sr, spread=0.5 * (lr + sr), bench=bench))
+        j += p["hold_days"]
+    return rows
+
+
+def _swing_stats(x):
+    x = np.asarray(x, float)
+    if len(x) < 2: return dict(n=len(x), mean=0.0, t=0.0, wr=0.0, dd=0.0)
+    sd = float(x.std(ddof=1)); eq = np.cumsum(x)
+    return dict(n=len(x), mean=round(float(x.mean()), 3), t=round(float(x.mean() / (sd / np.sqrt(len(x)))) if sd > 0 else 0.0, 2),
+                wr=round(100 * float((x > 0).mean()), 1), dd=round(float((np.maximum.accumulate(eq) - eq).max()), 1))
+
+
+def swing_data(symbols, years):
+    n = int(min(max(float(years), 0.5), 5.0) * 365) + 300
+    out, errors = {}, {}
+    for sym in dict.fromkeys(symbols):
+        try:
+            rows, _ = v10_futures_history(sym, "1d", n)
+            out[sym] = _rows_to_df(rows, "1d", n)
+        except Exception as ex: errors[sym] = f"{type(ex).__name__}: {str(ex)[:90]}"
+    return out, errors
+
+
+def trend_report(data, errors=None, years=3.0):
+    errors = errors or {}; allt = []; a = b = None; per_sym = {}
+    for sym, d in data.items():
+        trs, s, e = trend_replay(d)
+        for x in trs: x["sym"] = sym; x["coin"] = sym; x["data_start"] = s; x["data_end"] = e
+        allt += trs; per_sym[sym] = trs
+        if s: a = s if a is None else min(a, s); b = e if b is None else max(b, e)
+    L = [f"🧭 Swing Lab · اتجاه يومي (Donchian {SWING_DEFAULTS['don_n']}/{SWING_DEFAULTS['exit_n']} + EMA{SWING_DEFAULTS['ema_n']}) · {len(data)} عملة · {BOT_VERSION}",
+         f"وقف {SWING_DEFAULTS['stop_atr']}×ATR | الخروج: وقف أو كسر قناة {SWING_DEFAULTS['exit_n']} يوم | دخول عند افتتاح اليوم التالي | شراء وبيع",
+         f"💸 رسوم {FEE*100:.2f}% + انزلاق {SLIP*100:.2f}% لكل جهة + تمويل تقديري. TRAIN/TEST زمني لكل عملة."]
+    if not allt: return "\n".join(L + ["", "⚠️ لا صفقات — لا حكم."])
+    tr, te = split_trades_by_symbol(allt, a, b, 0.65); mt, me = metrics(tr), metrics(te)
+    L += ["", f"TRAIN: n={mt['n']} | WR {mt['wr']}% | PF {mt['pf']} | {mt['total']:+}R | متوسط {mt['avg']:+}R",
+          f"TEST : n={me['n']} | WR {me['wr']}% | PF {me['pf']} | {me['total']:+}R | متوسط {me['avg']:+}R | أقصى تراجع {me['dd']}R"]
+    if te:
+        mr = metrics(_real_cost_trades(te))
+        L.append(f"🧮 قبل التكلفة {np.mean([x['gross_R'] for x in te]):+.3f}R | التكلفة {np.mean([x['cost'] for x in te]):.3f}R | بتكلفة واقعية {mr['avg']:+}R PF {mr['pf']}")
+        for side, nm in ((1, "BUY"), (-1, "SELL")):
+            sub = [x for x in te if x["side"] == side]
+            if sub: m = metrics(sub); L.append(f"{nm}: n={m['n']} · WR {m['wr']}% · PF {m['pf']} · {m['total']:+}R · متوسط {m['avg']:+}R")
+        by = sorted(((c, metrics([x for x in te if x["sym"] == c])) for c in {x["sym"] for x in te}), key=lambda z: z[1]["total"])
+        L.append("الأسوأ: " + " | ".join(f"{c} {m['total']:+.1f}R" for c, m in by[:3]) + "  ||  الأفضل: " + " | ".join(f"{c} {m['total']:+.1f}R" for c, m in by[::-1][:3]))
+        # concentration: profits from a handful of trades are fragile
+        Rs = sorted([x["R"] for x in te], reverse=True)
+        if len(Rs) >= 10 and sum(Rs) > 0:
+            L.append(f"🎯 أفضل 10% من الصفقات تمثل {100*sum(Rs[:max(1, len(Rs)//10)])/max(sum(r for r in Rs if r > 0), 1e-9):.0f}% من إجمالي الأرباح")
+    L += ["", f"الحكم: {bt_verdict(mt, me)}"]
+    if errors: L += ["", f"⚠️ فشل {len(errors)} عملة: " + " | ".join(f"{k}: {v[:50]}" for k, v in list(errors.items())[:3])]
+    return "\n".join(L)
+
+
+def xsmom_report(data, errors=None, years=3.0):
+    errors = errors or {}
+    common = None
+    for d in data.values():
+        ts = set(d["t"].tolist()); common = ts if common is None else common & ts
+    if not common or len(data) < 8:
+        return "⚠️ Swing Lab · زخم مقطعي: يحتاج 8 عملات على الأقل بتاريخ مشترك."
+    times = np.array(sorted(common), dtype="int64")
+    closes = {s: d.set_index("t").loc[times, "close"].to_numpy(float) for s, d in data.items()}
+    opens = {s: d.set_index("t").loc[times, "open"].to_numpy(float) for s, d in data.items()}
+    rows = xsmom_replay(closes, opens, times)
+    L = [f"🧭 Swing Lab · زخم مقطعي أسبوعي (ترتيب {SWING_DEFAULTS['mom_n']} يوم، شراء أعلى {SWING_DEFAULTS['k']} وبيع أدنى {SWING_DEFAULTS['k']}) · {len(data)} عملة · {BOT_VERSION}",
+         f"إعادة موازنة كل {SWING_DEFAULTS['hold_days']} أيام | دخول/خروج عند الافتتاح | رسوم+انزلاق للطرفين، والتمويل على الشراء فقط. الأرقام % لكل أسبوع بعد التكلفة."]
+    if len(rows) < 30: return "\n".join(L + ["", f"⚠️ {len(rows)} أسبوعاً فقط — لا حكم."])
+    cut = int(len(rows) * 0.65); tr, te = rows[:cut], rows[cut:]
+    def line(name, key, part): s = _swing_stats([r[key] for r in part]); return f"{name}: أسابيع={s['n']} | متوسط {s['mean']:+}% | t={s['t']} | WR {s['wr']}% | تراجع {s['dd']}%"
+    L += ["", "— TRAIN —", line("شراء الأقوى", "long", tr), line("بيع الأضعف", "short", tr), line("الفرق (محايد للسوق)", "spread", tr), line("المؤشر (كل العملات)", "bench", tr),
+          "— TEST —", line("شراء الأقوى", "long", te), line("بيع الأضعف", "short", te), line("الفرق (محايد للسوق)", "spread", te), line("المؤشر (كل العملات)", "bench", te)]
+    ts_, tt_ = _swing_stats([r["spread"] for r in tr]), _swing_stats([r["spread"] for r in te])
+    if tt_["n"] < 30: verdict = "⚪ عينة TEST صغيرة — لا حكم"
+    elif tt_["mean"] > 0 and tt_["t"] >= 1.5 and ts_["mean"] > 0: verdict = "✅ الفرق موجب ومعنوي في TEST ومتسق مع TRAIN"
+    elif tt_["mean"] > 0 and ts_["mean"] > 0: verdict = "🟡 موجب لكن غير معنوي إحصائياً (t<1.5) — لا يكفي للاعتماد"
+    else: verdict = "🔴 لا ميزة بعد التكلفة"
+    L += ["", f"الحكم (على الفرق المحايد): {verdict}", "ملاحظة: الشراء وحده يتبع اتجاه السوق؛ قارنه دائماً بالمؤشر. المحايد هو الاختبار الحقيقي للميزة."]
+    if errors: L += ["", f"⚠️ فشل {len(errors)} عملة: " + " | ".join(f"{k}" for k in list(errors)[:5])]
+    return "\n".join(L)
+
+
+# ======================================================================================================================
+# Intraday lab (backtest-only): does the previous hour's move predict the next 1-4h, depending on the UTC hour?
+# Hours are chosen on TRAIN only (strict t-stat on per-day cross-sectional means); TEST is never used for selection.
+# ======================================================================================================================
+MAKER_FEE = 0.0002                       # maker fee per side (entry limit order model)
+INTRA_DEFAULTS = dict(holds=(1, 2, 4), zmin=1.0, tmin=3.0, min_days=60, stop_atr=1.5, atr_n=14, vol_span=72,
+                      train_ratio=0.65, maker_through_atr=0.1)
+_HMS = 3_600_000
+
+def _intra_feats(d, p):
+    t = d["t"].to_numpy("int64"); o = d["open"].to_numpy(float); h = d["high"].to_numpy(float)
+    l = d["low"].to_numpy(float); c = d["close"].to_numpy(float); n = len(c)
+    lr = np.diff(np.log(c), prepend=np.log(c[0]))
+    sig = pd.Series(lr).ewm(span=p["vol_span"], adjust=False, min_periods=p["vol_span"]).std().to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"): z = np.log(c / o) / sig
+    pc = np.concatenate([[c[0]], c[:-1]])
+    tr = np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
+    return dict(t=t, o=o, h=h, l=l, c=c, n=n, sig=sig, z=z, atr=_wilder_np(tr, p["atr_n"]), hour=((t // _HMS) % 24).astype(int))
+
+def _intra_valid(f, hold, p):
+    """Signal bar j (closed), entry = open of j+1, exit = close of bar j+hold. Requires gap-free hourly bars."""
+    n = f["n"]
+    if n <= hold + 2: return np.zeros(0, int), np.zeros(0, bool)
+    j = np.arange(n - hold)
+    ok = (np.isfinite(f["z"][j]) & (np.abs(f["z"][j]) > p["zmin"]) & np.isfinite(f["atr"][j]) & (f["atr"][j] > 0)
+          & (f["t"][j + hold] - f["t"][j] == hold * _HMS))
+    return j, ok
+
+def intra_hour_select(feats, hold, cut, params=None):
+    """Per UTC hour: mean of sign(z)*y (y = forward return / (sigma*sqrt(hold)), winsorised) averaged over symbols per day,
+    then a t-stat across days. Only observations whose trade has ENDED before `cut` are used. Returns ({hour: +1 momentum / -1 reversal}, table)."""
+    p = dict(INTRA_DEFAULTS); p.update(params or {})
+    parts = []
+    for f in feats.values():
+        j, ok = _intra_valid(f, hold, p)
+        if len(j) == 0: continue
+        ok = ok & (f["t"][j + hold] + _HMS <= cut)
+        if not ok.any(): continue
+        jj = j[ok]
+        y = np.clip(np.log(f["c"][jj + hold] / f["o"][jj + 1]) / (f["sig"][jj] * np.sqrt(hold)), -5, 5)
+        parts.append(pd.DataFrame(dict(day=f["t"][jj] // 86_400_000, hour=f["hour"][jj], s=np.sign(f["z"][jj]) * y)))
+    if not parts: return {}, {}
+    df = pd.concat(parts); dd = df.groupby(["day", "hour"])["s"].mean().reset_index()
+    g = dd.groupby("hour")["s"].agg(["mean", "std", "count"])
+    tab = {}; dirs = {}
+    for hr, r in g.iterrows():
+        tt = float(r["mean"] / (r["std"] / np.sqrt(r["count"]))) if r["count"] > 2 and r["std"] > 0 else 0.0
+        tab[int(hr)] = dict(mean=float(r["mean"]), t=tt, days=int(r["count"]))
+        if r["count"] >= p["min_days"] and abs(tt) >= p["tmin"]: dirs[int(hr)] = 1 if r["mean"] > 0 else -1
+    return dirs, tab
+
+def intra_trades(sym, f, hold, dirs, t_from, t_to, params=None):
+    """Trades whose SIGNAL candle opens in [t_from, t_to). One position per symbol at a time. Gross return in price terms;
+    costs are applied separately per cost model (see _intra_pack)."""
+    p = dict(INTRA_DEFAULTS); p.update(params or {})
+    j, ok = _intra_valid(f, hold, p)
+    if len(j) == 0 or not dirs: return []
+    hours_ok = np.isin(f["hour"][j], list(dirs))
+    cand = j[ok & hours_ok & (f["t"][j] >= t_from) & (f["t"][j] < t_to)]
+    out = []; busy = -1
+    for jj in cand:
+        jj = int(jj)
+        if jj < busy: continue
+        busy = jj + hold
+        side = dirs[int(f["hour"][jj])] * (1 if f["z"][jj] > 0 else -1)
+        fill = float(f["o"][jj + 1]); frac = min(max(p["stop_atr"] * float(f["atr"][jj]) / fill, 0.0025), 0.05)
+        stop = fill * (1 - side * frac); exit_px = float(f["c"][jj + hold]); kind = "TIME"
+        for k in range(jj + 1, jj + hold + 1):
+            if side == 1 and f["l"][k] <= stop: exit_px = min(float(f["o"][k]), stop); kind = "STOP"; break
+            if side == -1 and f["h"][k] >= stop: exit_px = max(float(f["o"][k]), stop); kind = "STOP"; break
+        thr = p["maker_through_atr"] * float(f["atr"][jj])
+        filled = bool(f["l"][jj + 1] <= fill - thr) if side == 1 else bool(f["h"][jj + 1] >= fill + thr)
+        out.append(dict(t=int(f["t"][jj + 1]), signal_t=int(f["t"][jj]) + _HMS, sym=sym, side=side, hold=hold, hour=int(f["hour"][jj]),
+                        gross=side * (exit_px / fill - 1.0), risk=frac, exit=kind, filled=filled,
+                        fund=FUNDING_8H * hold / 8.0))
+    return out
+
+def _intra_cost(model, x):
+    base = {"cfg": 2 * (FEE + SLIP), "real": 2 * (REAL_FEE + REAL_SLIP), "maker": MAKER_FEE + REAL_FEE + REAL_SLIP}[model]
+    return base + x["fund"]
+
+def _intra_pack(trs, model):
+    """Trades -> dicts for metrics(); R = (gross - cost)/risk. The maker model drops unfilled entries."""
+    return [dict(t=x["t"], R=round((x["gross"] - _intra_cost(model, x)) / x["risk"], 4), tps=0, sym=x["sym"])
+            for x in trs if model != "maker" or x["filled"]]
+
+def _intra_day_t(trs):
+    if len(trs) < 5: return 0.0
+    s = pd.DataFrame(dict(d=[x["t"] // 86_400_000 for x in trs], g=[x["gross"] for x in trs])).groupby("d")["g"].mean()
+    return float(s.mean() / (s.std(ddof=1) / np.sqrt(len(s)))) if len(s) > 2 and s.std(ddof=1) > 0 else 0.0
+
+def intra_data(symbols, years):
+    n = int(min(max(float(years), 0.5), 3.0) * 365 * 24) + 200
+    out, errors = {}, {}
+    for sym in dict.fromkeys(symbols):
+        try:
+            rows, _ = v10_futures_history(sym, "1h", n)
+            out[sym] = _rows_to_df(rows, "1h", n)
+        except Exception as ex: errors[sym] = f"{type(ex).__name__}: {str(ex)[:90]}"
+    return out, errors
+
+def intra_report(data, errors=None, years=2.0, params=None):
+    p = dict(INTRA_DEFAULTS); p.update(params or {}); errors = errors or {}
+    feats = {s: _intra_feats(d, p) for s, d in data.items() if len(d) > p["vol_span"] + 100}
+    L = [f"⏱️ Intraday Lab · زخم/انعكاس حسب ساعة UTC (شموع 1h) · {len(feats)} عملة · {BOT_VERSION}",
+         f"الإشارة: حركة الساعة المغلقة |z|>{p['zmin']:g}σ → دخول عند افتتاح الساعة التالية → خروج بعد {'/'.join(map(str, p['holds']))} ساعات أو وقف {p['stop_atr']}×ATR.",
+         f"اختيار الساعات على TRAIN فقط (|t|≥{p['tmin']:g} على متوسطات يومية عبر العملات)، وTEST لا يُلمس. تقسيم زمني {int(p['train_ratio']*100)}/{100-int(p['train_ratio']*100)}.",
+         f"💸 cfg: {2*(FEE+SLIP)*1e4:.0f}bp | واقعي: {2*(REAL_FEE+REAL_SLIP)*1e4:.0f}bp | ميكر دخول فقط: {(MAKER_FEE+REAL_FEE+REAL_SLIP)*1e4:.0f}bp (+تمويل تقديري). "
+         f"الميكر يتطلب كسر السعر {p['maker_through_atr']:g}×ATR لتنفيذ أمر الحد؛ غير المنفَّذ يُحذف."]
+    if not feats: return "\n".join(L + ["", "⚠️ بيانات غير كافية."])
+    a = min(int(f["t"][p["vol_span"]]) for f in feats.values()); b = max(int(f["t"][-1]) for f in feats.values())
+    cut = a + p["train_ratio"] * (b - a)
+    verdicts = []
+    for hold in p["holds"]:
+        dirs, tab = intra_hour_select(feats, hold, cut, p)
+        L += ["", f"━━ احتفاظ {hold} ساعة ━━"]
+        best = sorted(tab.items(), key=lambda kv: -abs(kv[1]["t"]))[:3]
+        L.append("أقوى 3 ساعات في TRAIN: " + " | ".join(f"{h:02d}h t={v['t']:+.1f}" for h, v in best))
+        # baselines: no hour selection at all
+        base = {}
+        for nm, dv in (("زخم", 1), ("انعكاس", -1)):
+            tt = [x for s, f in feats.items() for x in intra_trades(s, f, hold, {h: dv for h in range(24)}, cut, b + 1, p)]
+            base[nm] = (1e4 * float(np.mean([x["gross"] for x in tt])) if tt else 0.0, len(tt))
+        L.append(f"مرجع TEST بلا اختيار ساعات (قبل التكلفة): زخم {base['زخم'][0]:+.1f}bp · انعكاس {base['انعكاس'][0]:+.1f}bp (n≈{base['زخم'][1]})")
+        if not dirs:
+            L.append("⚪ لا ساعة تجتاز العتبة في TRAIN → لا استراتيجية لهذا الاحتفاظ."); verdicts.append("لا ساعات"); continue
+        L.append("ساعات مختارة: " + " ".join(f"{h:02d}h{'↑زخم' if d > 0 else '↓انعكاس'}" for h, d in sorted(dirs.items())))
+        tr_t = [x for s, f in feats.items() for x in intra_trades(s, f, hold, dirs, a, cut, p) if x["t"] + hold * _HMS <= cut]
+        te_t = [x for s, f in feats.items() for x in intra_trades(s, f, hold, dirs, cut, b + 1, p)]
+        if not te_t: L.append("⚪ لا صفقات TEST."); verdicts.append("لا صفقات"); continue
+        gb = 1e4 * float(np.mean([x["gross"] for x in te_t])); gtr = 1e4 * float(np.mean([x["gross"] for x in tr_t])) if tr_t else 0.0
+        te_s = sorted(te_t, key=lambda x: x["t"]); h2 = len(te_s) // 2
+        g1 = 1e4 * float(np.mean([x["gross"] for x in te_s[:h2]])) if h2 else 0.0; g2 = 1e4 * float(np.mean([x["gross"] for x in te_s[h2:]]))
+        L.append(f"قبل التكلفة: TRAIN {gtr:+.1f}bp (داخل العينة) | TEST {gb:+.1f}bp (t يومي {_intra_day_t(te_t):+.1f}, n={len(te_t)}) | نصفا TEST: {g1:+.1f} / {g2:+.1f}bp")
+        for model, nm in (("cfg", "رسوم الإعداد"), ("real", "تكلفة واقعية"), ("maker", "ميكر")):
+            m_te = metrics(_intra_pack(te_t, model));
+            extra = f" · تنفيذ {100*np.mean([x['filled'] for x in te_t]):.0f}%" if model == "maker" else ""
+            L.append(f"{nm}: n={m_te['n']} · WR {m_te['wr']}% · PF {m_te['pf']} · متوسط {m_te['avg']:+}R · مجموع {m_te['total']:+}R{extra}")
+        if sum(not x["filled"] for x in te_t):
+            miss = [x["gross"] for x in te_t if not x["filled"]]
+            L.append(f"🪤 الصفقات غير المنفَّذة (ميكر) كان متوسطها {1e4*np.mean(miss):+.1f}bp — الفرق مع المنفَّذة = انتقاء عكسي.")
+        v = bt_verdict(metrics(_intra_pack(tr_t, "real")), metrics(_intra_pack(te_t, "real"))); L.append(f"الحكم (تكلفة واقعية): {v}"); verdicts.append(v)
+    L += ["", "⚠️ اختُبرت 3 فترات احتفاظ × 24 ساعة: أي ✅ منفرد يضعف إحصائيًا — أعد الاختبار على فترة/عملات أخرى قبل أي اعتماد.",
+          "ℹ️ الصفقات بين العملات مترابطة؛ لذلك t محسوب على متوسطات يومية."]
+    if errors: L += ["", f"⚠️ فشل {len(errors)} عملة: " + " | ".join(f"{k}: {v[:50]}" for k, v in list(errors.items())[:3])]
+    return "\n".join(L)
+
 def backtest_many(symbols, years=1.0, max_workers=1):
     """Run backtest_symbol over a list of symbols; every failure is recorded per symbol, never swallowed."""
     per,tmin,tmax,errors={},None,None,{}
@@ -5411,7 +5839,7 @@ async def cmd_post(update,ctx):
     await update.message.reply_text(f"✅ نُشر: {', '.join(sent)}")
 
 
-async def _run_bt(update,syms,label,years):
+async def _run_bt(update,ctx,syms,label,years):
     """Shared runner for /bt /backtest /btv10 /bt50 /btdiag: one engine, one report, one busy-lock."""
     syms=[x for x in (syms or []) if x]
     if not syms:
@@ -5432,9 +5860,13 @@ async def _run_bt(update,syms,label,years):
             buf=io.BytesIO(csv_bytes)
             safe_label=re.sub(r"[^A-Za-z0-9_-]+","_",str(label)).strip("_") or "ALL"
             buf.name=f"Ryma_v10_{safe_label}_{years:g}y_trades.csv"
-            await ctx.bot.send_document(update.effective_chat.id,document=buf,filename=buf.name,
-                caption=f"سجل صفقات Backtest {BOT_VERSION} · {len(rows)} صفقة · للتحليل فقط",
-                protect_content=False,read_timeout=120,write_timeout=120,connect_timeout=30)
+            try:
+                await ctx.bot.send_document(update.effective_chat.id,document=buf,filename=buf.name,
+                    caption=f"سجل صفقات Backtest {BOT_VERSION} · {len(rows)} صفقة · للتحليل فقط",
+                    protect_content=False,read_timeout=120,write_timeout=120,connect_timeout=30)
+            except Exception as ex:
+                log.warning("bt csv export failed: %s",ex)
+                await update.message.reply_text("⚠️ تعذّر إرسال ملف CSV (التقرير أعلاه سليم).")
     finally:
         _BT_BUSY[0]=False
 
@@ -5447,7 +5879,7 @@ async def cmd_bt(update,ctx):
     if arg in ("ALL",""): syms,label=list(COINS),"ALL"
     elif arg in ("TOP","TOP50"): syms,label=await asyncio.to_thread(top_symbols,50),"TOP50"
     else: syms,label=[clean_symbol(arg)],clean_symbol(arg)
-    await _run_bt(update,syms,label,years)
+    await _run_bt(update,ctx,syms,label,years)
 
 # ======================= AI walk-forward backtest (/btdiag) =======================
 _BT_BUSY=[False]
@@ -5577,6 +6009,71 @@ async def cmd_btx(update, ctx):
     finally:
         _BT_BUSY[0] = False
 
+
+@admin_only
+async def cmd_bts(update, ctx):
+    """/bts [trend|xsmom|all] [TOP20|BTC,ETH,...] [years<=5] — swing (daily/weekly) strategies lab."""
+    arg = (ctx.args[0].lower() if ctx.args else "all")
+    if arg not in ("trend", "xsmom", "all"):
+        await update.message.reply_text("الاستعمال: /bts trend|xsmom|all [TOP20|BTC,ETH,..] [years]"); return
+    sel = (ctx.args[1].upper() if len(ctx.args) > 1 else "TOP20")
+    try: years = min(max(float(ctx.args[2]), 0.5), 5.0) if len(ctx.args) > 2 else 3.0
+    except ValueError: years = 3.0
+    if sel.startswith("TOP"):
+        try: n = min(max(int(sel[3:] or 20), 8), 40)
+        except ValueError: n = 20
+        syms = list(await asyncio.to_thread(top_symbols, n))
+    else: syms = [clean_symbol(x) for x in sel.replace(" ", "").split(",") if x][:40]
+    if _BT_BUSY[0]:
+        await update.message.reply_text("⏳ يوجد اختبار آخر قيد التشغيل؛ انتظر حتى ينتهي."); return
+    _BT_BUSY[0] = True
+    wait = await update.message.reply_text(f"⏳ Swing Lab · {len(syms)} عملة · {years:g} سنة — تحميل البيانات اليومية.")
+    try:
+        data, errors = await asyncio.to_thread(swing_data, syms, years)
+        if not data:
+            await wait.edit_text("⚠️ لم تُحمَّل أي بيانات: " + "; ".join(f"{k}: {v}" for k, v in list(errors.items())[:3])); return
+        texts = []
+        if arg in ("trend", "all"): texts.append(await asyncio.to_thread(trend_report, data, errors, years))
+        if arg in ("xsmom", "all"): texts.append(await asyncio.to_thread(xsmom_report, data, errors, years))
+        await wait.edit_text(texts[0][:4000], link_preview_options=NO_PREVIEW)
+        for tx in texts[1:]: await update.message.reply_text(tx[:4000], link_preview_options=NO_PREVIEW)
+    except Exception as ex:
+        log.exception("bts")
+        try: await wait.edit_text(f"⚠️ {type(ex).__name__}: {str(ex)[:150]}")
+        except Exception: pass
+    finally:
+        _BT_BUSY[0] = False
+
+
+@admin_only
+async def cmd_btt(update, ctx):
+    """/btt [TOP12|BTC,ETH,...] [years<=3] — intraday hour-of-day lab (1-4h holds, TRAIN-only hour selection)."""
+    sel = (ctx.args[0].upper() if ctx.args else "TOP12")
+    try: years = min(max(float(ctx.args[1]), 0.5), 3.0) if len(ctx.args) > 1 else 2.0
+    except ValueError: years = 2.0
+    if sel.startswith("TOP"):
+        try: n = min(max(int(sel[3:] or 12), 5), 30)
+        except ValueError: n = 12
+        syms = list(await asyncio.to_thread(top_symbols, n))
+    else: syms = [clean_symbol(x) for x in sel.replace(" ", "").split(",") if x][:30]
+    if _BT_BUSY[0]:
+        await update.message.reply_text("⏳ يوجد اختبار آخر قيد التشغيل؛ انتظر حتى ينتهي."); return
+    _BT_BUSY[0] = True
+    wait = await update.message.reply_text(f"⏳ Intraday Lab · {len(syms)} عملة · {years:g} سنة — تحميل شموع الساعة.")
+    try:
+        data, errors = await asyncio.to_thread(intra_data, syms, years)
+        if not data:
+            await wait.edit_text("⚠️ لم تُحمَّل أي بيانات: " + "; ".join(f"{k}: {v}" for k, v in list(errors.items())[:3])); return
+        tx = await asyncio.to_thread(intra_report, data, errors, years)
+        await wait.edit_text(tx[:4000], link_preview_options=NO_PREVIEW)
+        if len(tx) > 4000: await update.message.reply_text(tx[4000:8000], link_preview_options=NO_PREVIEW)
+    except Exception as ex:
+        log.exception("btt")
+        try: await wait.edit_text(f"⚠️ {type(ex).__name__}: {str(ex)[:150]}")
+        except Exception: pass
+    finally:
+        _BT_BUSY[0] = False
+
 @admin_only
 async def cmd_btdiag(update,ctx):
     """Quick diagnostic: the same v10 backtest on the 3 most liquid coins."""
@@ -5585,7 +6082,7 @@ async def cmd_btdiag(update,ctx):
         try: years=min(max(float(arg),0.1),3.0)
         except ValueError: pass
     syms=await asyncio.to_thread(top_symbols,3)
-    await _run_bt(update,syms,"TOP3",years)
+    await _run_bt(update,ctx,syms,"TOP3",years)
 
 # ======================= تصدير بيانات البحث (/exportdata) =======================
 # يقرأ بيانات عامة من Binance فقط (لا توكن ولا مفاتيح) ويرسل ملفات ZIP للأدمن.
@@ -5753,7 +6250,7 @@ async def cmd_bt50(update,ctx):
     try: years=min(max(float(ctx.args[0]),0.1),3.0) if ctx.args else 1.0
     except ValueError: years=1.0
     syms=await asyncio.to_thread(top_symbols,50)
-    await _run_bt(update,syms if isinstance(syms,(list,tuple)) else [],"TOP50",years)
+    await _run_bt(update,ctx,syms if isinstance(syms,(list,tuple)) else [],"TOP50",years)
 
 @admin_only
 async def cmd_scan(update,ctx):
@@ -5962,7 +6459,7 @@ ADMIN_CMD_MAP={
     "/cross":cmd_cross,"/predict":cmd_predict,"/whales":cmd_whales,
     "/explosions":cmd_explosions,"/pump":cmd_pump,"/bottom":cmd_bottoms,
     "/shortsradar":cmd_shorts_radar,"/alpha":cmd_alpha,"/scan":cmd_scan,
-    "/short":cmd_short,"/bt":cmd_bt,"/btv10":cmd_bt,"/btx":cmd_btx,"/btopt":cmd_btopt,"/v10set":cmd_v10set,"/v10show":cmd_v10show,"/bt50":cmd_bt50,"/users":cmd_users,
+    "/short":cmd_short,"/bt":cmd_bt,"/btv10":cmd_bt,"/btx":cmd_btx,"/bts":cmd_bts,"/btt":cmd_btt,"/btopt":cmd_btopt,"/v10set":cmd_v10set,"/v10show":cmd_v10show,"/bt50":cmd_bt50,"/users":cmd_users,
     "/viplist":cmd_viplist,"/stats":cmd_stats,"/history":cmd_history,
     "/dashboard":cmd_dashboard,"/testchannels":cmd_testchannels,"/delist":cmd_delist,
     "/golden":cmd_golden,"/share":cmd_share,
@@ -6712,7 +7209,8 @@ def _trendspider_normalize(payload):
     if not sym or not side or not stamp:
         raise ValueError("required fields: symbol, action (buy/sell), timestamp")
     safe_payload={k:v for k,v in payload.items() if str(k).lower() not in ("secret","token")}
-    return {"id":event_id,"symbol":sym,"side":side,"timestamp":stamp,"raw":safe_payload}
+    return {"id":event_id,"symbol":sym,"side":side,"timestamp":stamp,"raw":safe_payload,
+            "strategy":str(payload.get("strategy") or payload.get("name") or payload.get("alert") or "")[:40]}
 
 async def _trendspider_webhook(request):
     if _aiohttp_web is None:
@@ -6730,7 +7228,7 @@ async def _trendspider_webhook(request):
         supplied=auth[7:].strip()
     if not supplied:
         supplied=str(payload.get("secret") or payload.get("token") or "")
-    if not __import__("hmac").compare_digest(supplied,TRENDSPIDER_SECRET):
+    if not hmac.compare_digest(str(supplied).encode("utf-8","replace"),TRENDSPIDER_SECRET.encode("utf-8")):
         return _aiohttp_web.json_response({"ok":False,"error":"unauthorized"},status=401)
     try:
         alert=_trendspider_normalize(payload)
@@ -6760,25 +7258,12 @@ async def _trendspider_worker(app):
     while True:
         alert=await _trendspider_queue.get()
         try:
-            sym=alert["symbol"]
-            res=await asyncio.to_thread(get_analysis,sym,True)
-            if not res or not res.get("lv"):
-                log.warning("TrendSpider alert skipped: no local analysis for %s",sym)
-                continue
-            if int(res.get("side",0))!=int(alert["side"]):
-                log.warning("TrendSpider alert direction disagrees with Ryma for %s; skipped",sym)
-                continue
-            if not _grade_ok(res.get("grade","C")):
-                log.warning("TrendSpider alert grade blocked for %s (%s)",sym,res.get("grade"))
-                continue
-            res["trendspider_alert"]={"id":alert["id"],"timestamp":alert["timestamp"]}
+            res=await asyncio.to_thread(_trendspider_signal,alert)
+            if res is None: continue
             if not _can_post(res):
-                log.info("TrendSpider duplicate/active/cooldown skipped for %s",sym)
-                continue
-            sent=await publish(app.bot,res,vip=True,free=True,admin_copy=True)
-            if _sent_ok(sent,"VIP_") or _sent_ok(sent,"FREE_"):
-                _mark_posted(res)
-                log.info("TrendSpider alert published through Ryma for %s",sym)
+                log.info("TrendSpider duplicate/active/cooldown skipped for %s",res["sym"]); continue
+            tier,sent,ok,_r=await dispatch_signal(app.bot,res,admin_copy=True)
+            if ok: log.info("TrendSpider alert published for %s (tier=%s grade=%s confirm=%s)",res["sym"],tier,res["grade"],res["ts_confirm"])
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -6829,7 +7314,7 @@ async def post_init(app):
     app.bot_data["tasks"] += [
         asyncio.create_task(autopost_loop(app)),asyncio.create_task(tracker_loop(app)),
         asyncio.create_task(predict_loop(app)),asyncio.create_task(market_summary_loop(app)),
-        asyncio.create_task(short_free_loop(app)),asyncio.create_task(alpha_summary_loop(app)),
+        *([asyncio.create_task(short_free_loop(app))] if SHORT_FREE_LOOP else []),asyncio.create_task(alpha_summary_loop(app)),
         asyncio.create_task(bottoms_auto_loop(app)),
         asyncio.create_task(golden_loop(app)),asyncio.create_task(promo_loop(app)),
         asyncio.create_task(whale_hunter_loop(app)),
@@ -6837,7 +7322,7 @@ async def post_init(app):
         asyncio.create_task(morning_brief_loop(app)),
         asyncio.create_task(shadow_loop(app))]
     log.info("version %s",BOT_VERSION)
-    log.info("Ryma v10 Hybrid RC5 | max_open=%d | golden=%ds | engine=%s/%s | multi=%s | points=%d→VIP%d | SL≤3%% hard",
+    log.info("Ryma v10 Hybrid RC7.0 | max_open=%d | golden=%ds | engine=%s/%s | multi=%s | points=%d→VIP%d | SL≤3%% hard",
              MAX_OPEN,CYCLE_GOLDEN,RYMA_AI_PROVIDER,RYMA_AI_MODEL,is_multi_exchange(),
              VIP_THRESHOLD,VIP_REWARD_DAYS)
 
@@ -6859,7 +7344,7 @@ def main():
         ("menu",cmd_menu),("daily",cmd_daily),("cross",cmd_cross),("predict",cmd_predict),
         ("forcepost",cmd_forcepost),("clearsignals",cmd_clearsignals),
         ("smartcleanup",cmd_smartcleanup),("debug",cmd_debug),("health",cmd_health),("regime",cmd_regime),("smartmoney",cmd_smartmoney),("active",cmd_active),
-        ("post",cmd_post),("bt",cmd_bt),("backtest",cmd_bt),("btv10",cmd_bt),("btx",cmd_btx),("btopt",cmd_btopt),("v10set",cmd_v10set),("v10show",cmd_v10show),("bt50",cmd_bt50),
+        ("post",cmd_post),("bt",cmd_bt),("backtest",cmd_bt),("btv10",cmd_bt),("btx",cmd_btx),("bts",cmd_bts),("btt",cmd_btt),("btopt",cmd_btopt),("v10set",cmd_v10set),("v10show",cmd_v10show),("bt50",cmd_bt50),
         ("scan",cmd_scan),("short",cmd_short),("delist",cmd_delist),("price",cmd_price),
         ("users",cmd_users),("testchannels",cmd_testchannels),("stats",cmd_stats),
         ("history",cmd_history),("dashboard",cmd_dashboard),
