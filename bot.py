@@ -5033,8 +5033,20 @@ def bt_report(per,tmin,tmax,label,errors=None):
     else:
         tr,te=split_trades_by_symbol(allt,tmin,tmax,2.0/3.0)
         mt,me=metrics(tr),metrics(te)
+        def _bt_dates(rows):
+            ts=[int(x.get("t",0)) for x in rows if isinstance(x.get("t"),(int,float)) and int(x.get("t",0))>0]
+            if not ts: return "—"
+            a=dt.datetime.fromtimestamp(min(ts)/1000,dt.timezone.utc).strftime("%Y-%m-%d")
+            b=dt.datetime.fromtimestamp(max(ts)/1000,dt.timezone.utc).strftime("%Y-%m-%d")
+            return f"{a} → {b} UTC"
+        def _bt_sides(rows):
+            buy=sum(1 for x in rows if int(x.get("side",0))==1)
+            sell=sum(1 for x in rows if int(x.get("side",0))==-1)
+            return f"BUY {buy} | SELL {sell}"
         lines += ["",f"📈 TRAIN: n={mt['n']} | WR {mt['wr']}% | PF {mt['pf']} | {mt['total']:+}R | متوسط {mt['avg']:+}R",
                   f"📊 TEST : n={me['n']} | WR {me['wr']}% | PF {me['pf']} | {me['total']:+}R | متوسط {me['avg']:+}R",
+                  f"🗓️ فترة TRAIN: {_bt_dates(tr)} | {_bt_sides(tr)}",
+                  f"🗓️ فترة TEST: {_bt_dates(te)} | {_bt_sides(te)}",
                   f"🎯 وصول TP1 في TEST: {me['tp1']}% | أقصى تراجع TEST: {me['dd']}R"]
         if te:
             gross=float(np.mean([x["gross_R"] for x in te])); cost=float(np.mean([x["cost"] for x in te]))
