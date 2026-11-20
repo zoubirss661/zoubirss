@@ -4064,25 +4064,36 @@ def v10_replay(sym,d4,h1,m15,max_decisions=None,params=None):
 
 
 def _bt_frames(sym,years=1.0):
-    """Download 4H/1H/15M futures history once (shared by /bt and the optimiser)."""
+    """Legacy long-history loader retained for the optimiser and research tools."""
     years=min(max(float(years),0.1),3.0)
     bars={"15m":int(years*365*96)+400,"1h":int(years*365*24)+300,"4h":int(years*365*6)+300}
+    return _bt_frames_bars(sym,bars)
+
+
+def _bt_frames_bars(sym,bars):
+    """Load synchronized linear-futures OHLCV from one venue, with warm-up history."""
     minimum={"4h":210,"1h":205,"15m":100}
-    frames={}; sources={}
-    # Choose one linear-Futures venue on 4H, then pin 1H and 15M to that exact venue.
-    # Live analysis rejects mixed venues; the backtest must enforce the same integrity rule.
-    pinned_source=None
+    frames={}; sources={}; pinned_source=None
     for tf in ("4h","1h","15m"):
-        rows,source=v10_futures_history(sym,tf,bars[tf],preferred_source=pinned_source)
+        rows,source=v10_futures_history(sym,tf,int(bars[tf]),preferred_source=pinned_source)
         source=normalize_futures_source(source)
-        if pinned_source is None:
-            pinned_source=source
+        if pinned_source is None: pinned_source=source
         elif source!=pinned_source:
             raise NoData(f"{sym}: mixed Futures venues rejected ({pinned_source} vs {source} on {tf})")
-        raw=_rows_to_df(rows,tf,bars[tf])
-        if len(raw)<minimum[tf]: raise NoData(f"{sym}: بيانات Futures غير كافية لـ {tf} من {source} ({len(raw)}/{minimum[tf]})")
+        raw=_rows_to_df(rows,tf,int(bars[tf]))
+        if len(raw)<minimum[tf]:
+            raise NoData(f"{sym}: بيانات Futures غير كافية لـ {tf} من {source} ({len(raw)}/{minimum[tf]})")
         frames[tf]=add_indicators(raw,100); sources[tf]=source
     return frames["4h"],frames["1h"],frames["15m"],", ".join(f"{tf}:{s}" for tf,s in sources.items())
+
+
+def _bt_frames_days(sym,days=60):
+    """Exact recent intraday window plus closed-candle warm-up for 4H/1H indicators."""
+    days=int(min(max(int(days),30),60))
+    # The replay waits for 204 closed 1H and 210 closed 4H candles.
+    # These are warm-up only; the first eligible 15M decision is approximately `days` ago.
+    bars={"15m":days*96+120,"1h":days*24+205,"4h":days*6+212}
+    return _bt_frames_bars(sym,bars)
 
 
 def backtest_symbol(sym, years=1.0, params=None):
@@ -4961,6 +4972,38 @@ def backtest_many(symbols, years=1.0, max_workers=1):
     return per,tmin,tmax,errors
 
 
+def backtest_symbol_days(sym,days=60,params=None):
+    """Replay the live MTF engine over the most recent 30/60 days."""
+    d4,h1,m15,summary=_bt_frames_days(sym,days)
+    trades,a,b=v10_replay(sym,d4,h1,m15,params=params)
+    for tr in trades:
+        tr["data_source"]=summary
+        tr["test_window_days"]=int(days)
+    if not a: raise NoData(f"{sym}: تاريخ غير كافٍ للتشغيل")
+    return trades,a,b
+
+
+def backtest_many_days(symbols,days=60,max_workers=1):
+    """Run recent-window tests and preserve per-symbol loading errors."""
+    per,tmin,tmax,errors={},None,None,{}
+    symbols=list(dict.fromkeys(s.strip().upper() for s in (symbols or []) if isinstance(s,str) and s.strip()))
+    if not symbols: return per,tmin,tmax,errors
+    def _one(sym):
+        try:
+            trs,a,b=backtest_symbol_days(sym,days)
+            return sym,(trs,int(a),int(b)),None
+        except Exception as ex:
+            log.warning("recent backtest failed for %s: %s",sym,str(ex)[:160])
+            return sym,None,f"{type(ex).__name__}: {ex}"
+    workers=max(1,min(int(max_workers or 1),2,len(symbols)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for sym,result,error in pool.map(_one,symbols):
+            if error: errors[sym]=error; continue
+            trs,a,b=result; per[sym]=trs
+            tmin=a if tmin is None else min(tmin,a); tmax=b if tmax is None else max(tmax,b)
+    return per,tmin,tmax,errors
+
+
 def bt_verdict(mt,me):
     """Verdict needs a big enough TEST sample, positive expectancy AFTER costs and a TRAIN period that does not contradict it."""
     if me["n"]<30: return "⚪ عينة TEST صغيرة (أقل من 30 صفقة) — لا حكم"
@@ -4972,21 +5015,23 @@ def bt_verdict(mt,me):
 
 def bt_report(per,tmin,tmax,label,errors=None):
     errors=errors or {}
+    _window_match=re.search(r"(\\d+)D",str(label).upper())
+    _window_days=_window_match.group(1) if _window_match else "غير محددة"
     allt=[x for tr in (per or {}).values() if isinstance(tr,list) for x in tr
           if isinstance(x,dict) and isinstance(x.get("t"),(int,float)) and isinstance(x.get("R"),(int,float))]
     lines=[f"📊 Backtest v10 · {label} ({len(per or {})} عملة صالحة) · {BOT_VERSION}",
            f"📥 عملات فشل تحميلها/اختبارها: {len(errors)}",
            "🧠 المحرك المُختبَر = نفس محرك الإشارات الحية: 4H نظام + 1H تأكيد + 15M محفز (فرص مؤكدة فقط).",
-           "🕯️ القرار عند إغلاق شمعة 15M، الدخول عند افتتاح التالية، والإدارة بنفس trade_step الحي (TP جزئي، BE بعد TP1، Trailing بعد TP2، حد أقصى 4 ساعات).",
+           "🕯️ القرار عند إغلاق شمعة 15M، الدخول عند افتتاح التالية، والإدارة بنفس trade_step الحي (TP جزئي، BE بعد TP1، Trailing بعد TP2، حد أقصى 48 ساعة).",
            f"⚙️ المعاملات: {v10_params()}",
            f"💸 الرسوم {FEE*100:.2f}% + انزلاق {SLIP*100:.2f}% لكل جهة + تمويل تقديري {FUNDING_8H*100:.3f}%/8س. التمويل التاريخي الفعلي غير مضمّن.",
-           "🧪 التقسيم TRAIN/TEST زمني لكل عملة. القواعد ثابتة غير مضبوطة على البيانات، لذا TRAIN/TEST اختبار ثبات لا اختبار تدريب."]
+           f"🧪 نافذة حديثة: {_window_days} يوم؛ تقسيم زمني لكل عملة بنسبة 2/3 TRAIN و1/3 TEST. القواعد ثابتة غير مضبوطة على البيانات."]
     if str(label).upper().startswith("TOP"):
         lines.append("⚠️ قائمة TOP مبنية على سيولة اليوم؛ فيها انحياز بقاء (survivorship).")
     if not allt:
         lines += ["","⚠️ لم تنتج الفترة أي فرصة مؤكدة للاختبار — لا يمكن الحكم، ولا أرقام وهمية."]
     else:
-        tr,te=split_trades_by_symbol(allt,tmin,tmax,0.65)
+        tr,te=split_trades_by_symbol(allt,tmin,tmax,2.0/3.0)
         mt,me=metrics(tr),metrics(te)
         lines += ["",f"📈 TRAIN: n={mt['n']} | WR {mt['wr']}% | PF {mt['pf']} | {mt['total']:+}R | متوسط {mt['avg']:+}R",
                   f"📊 TEST : n={me['n']} | WR {me['wr']}% | PF {me['pf']} | {me['total']:+}R | متوسط {me['avg']:+}R",
@@ -5839,8 +5884,22 @@ async def cmd_post(update,ctx):
     await update.message.reply_text(f"✅ نُشر: {', '.join(sent)}")
 
 
-async def _run_bt(update,ctx,syms,label,years):
-    """Shared runner for /bt /backtest /btv10 /bt50 /btdiag: one engine, one report, one busy-lock."""
+def _parse_bt_days(value=None,default=60):
+    """Accept the agreed 30/60-day windows; default safely to 60 days."""
+    if value is None: return int(default)
+    raw=str(value).strip().lower()
+    if raw.endswith("d"):
+        try: n=int(float(raw[:-1]))
+        except ValueError: return int(default)
+        return min(max(n,30),60)
+    try: n=float(raw)
+    except (TypeError,ValueError): return int(default)
+    if n in (30,60): return int(n)
+    return int(default)
+
+
+async def _run_bt(update,ctx,syms,label,days):
+    """Recent 30/60-day backtest runner; live engine and trade_step remain unchanged."""
     syms=[x for x in (syms or []) if x]
     if not syms:
         await update.message.reply_text("❌ لا توجد عملات للاختبار"); return
@@ -5848,21 +5907,22 @@ async def _run_bt(update,ctx,syms,label,years):
         await update.message.reply_text("⏳ يوجد اختبار آخر قيد التشغيل؛ انتظر حتى ينتهي."); return
     _BT_BUSY[0]=True
     try:
-        wait=await update.message.reply_text(f"⏳ Backtest v10 على {len(syms)} عملة · {years:g} سنة\n4H + 1H + 15M — تحميل البيانات قد يستغرق دقائق.")
-        per,a,b,errors=await asyncio.to_thread(backtest_many,syms,years,1)
+        label=f"{label} · {int(days)}D"
+        wait=await update.message.reply_text(
+            f"⏳ Backtest v10 على {len(syms)} عملة · آخر {int(days)} يوماً\\n"
+            "4H + 1H + 15M — بيانات تمهيدية للمؤشرات خارج نافذة القياس.")
+        per,a,b,errors=await asyncio.to_thread(backtest_many_days,syms,int(days),1)
         text,_=bt_report(per,a,b,label,errors)
         await wait.edit_text(text[:4000],link_preview_options=NO_PREVIEW)
-        # Export trade-level evidence so a bad aggregate can be diagnosed by symbol,
-        # timestamp, gross/net R, risk distance, costs, grade and exit type.
         rows=[dict(x) for tr in (per or {}).values() for x in (tr or []) if isinstance(x,dict)]
         if rows:
             csv_bytes=pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
             buf=io.BytesIO(csv_bytes)
             safe_label=re.sub(r"[^A-Za-z0-9_-]+","_",str(label)).strip("_") or "ALL"
-            buf.name=f"Ryma_v10_{safe_label}_{years:g}y_trades.csv"
+            buf.name=f"Ryma_v10_{safe_label}_{int(days)}d_trades.csv"
             try:
                 await ctx.bot.send_document(update.effective_chat.id,document=buf,filename=buf.name,
-                    caption=f"سجل صفقات Backtest {BOT_VERSION} · {len(rows)} صفقة · للتحليل فقط",
+                    caption=f"سجل صفقات Backtest {BOT_VERSION} · {len(rows)} صفقة · نافذة {int(days)} يوم · للتحليل فقط",
                     protect_content=False,read_timeout=120,write_timeout=120,connect_timeout=30)
             except Exception as ex:
                 log.warning("bt csv export failed: %s",ex)
@@ -5870,16 +5930,16 @@ async def _run_bt(update,ctx,syms,label,years):
     finally:
         _BT_BUSY[0]=False
 
+
 @admin_only
 async def cmd_bt(update,ctx):
-    """/bt [SYMBOL|ALL|TOP50] [years<=3] — also /backtest and /btv10 (they are the same test now)."""
+    """/bt [SYMBOL|ALL|TOP50] [60|30|60d|30d] — default: last 60 days."""
     arg=ctx.args[0].upper() if ctx.args else "ALL"
-    try: years=min(max(float(ctx.args[1]),0.1),3.0) if len(ctx.args)>1 else 1.0
-    except ValueError: years=1.0
+    days=_parse_bt_days(ctx.args[1] if len(ctx.args)>1 else None,60)
     if arg in ("ALL",""): syms,label=list(COINS),"ALL"
     elif arg in ("TOP","TOP50"): syms,label=await asyncio.to_thread(top_symbols,50),"TOP50"
     else: syms,label=[clean_symbol(arg)],clean_symbol(arg)
-    await _run_bt(update,ctx,syms,label,years)
+    await _run_bt(update,ctx,syms,label,days)
 
 # ======================= AI walk-forward backtest (/btdiag) =======================
 _BT_BUSY=[False]
@@ -6076,13 +6136,10 @@ async def cmd_btt(update, ctx):
 
 @admin_only
 async def cmd_btdiag(update,ctx):
-    """Quick diagnostic: the same v10 backtest on the 3 most liquid coins."""
-    years=1.0
-    for arg in ctx.args:
-        try: years=min(max(float(arg),0.1),3.0)
-        except ValueError: pass
+    """Quick diagnostic on the 3 most liquid coins, last 30/60 days."""
+    days=_parse_bt_days(ctx.args[0] if ctx.args else None,60)
     syms=await asyncio.to_thread(top_symbols,3)
-    await _run_bt(update,ctx,syms,"TOP3",years)
+    await _run_bt(update,ctx,syms,"TOP3",days)
 
 # ======================= تصدير بيانات البحث (/exportdata) =======================
 # يقرأ بيانات عامة من Binance فقط (لا توكن ولا مفاتيح) ويرسل ملفات ZIP للأدمن.
@@ -6247,10 +6304,10 @@ async def cmd_exportdata(update,ctx):
 
 @admin_only
 async def cmd_bt50(update,ctx):
-    try: years=min(max(float(ctx.args[0]),0.1),3.0) if ctx.args else 1.0
-    except ValueError: years=1.0
+    days=_parse_bt_days(ctx.args[0] if ctx.args else None,60)
     syms=await asyncio.to_thread(top_symbols,50)
-    await _run_bt(update,ctx,syms if isinstance(syms,(list,tuple)) else [],"TOP50",years)
+    await _run_bt(update,ctx,syms if isinstance(syms,(list,tuple)) else [],"TOP50",days)
+
 
 @admin_only
 async def cmd_scan(update,ctx):
